@@ -2,6 +2,7 @@ import os
 import sys
 import subprocess
 import time
+from updater import check_and_update
 
 # Hacker Matrix Color Palette
 GREEN = '\033[38;5;46m'
@@ -22,7 +23,8 @@ def banner(platform, fmt):
     print(f"{DARK_GREEN}  >> SOURCE: Mirror Note/{platform}.txt | MODE: STEALTH{RESET}\n")
 
 def download_media(platform_name, format_type):
-    # Sirf .txt file hi read karega
+    check_and_update(force=False, silent=True)
+
     file_path = os.path.join(BASE_DIR, f"{platform_name}.txt")
     output_template = "/storage/emulated/0/Download/%(title).80s.%(ext)s"
 
