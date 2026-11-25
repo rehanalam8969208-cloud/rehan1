@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import json
 import glob
@@ -24,6 +25,44 @@ STOP_EVENT = threading.Event()
 ACTIVE_DOWNLOAD_PROCS = set()
 PROC_LOCK = threading.Lock()
 
+SEEN_IDS = set()
+SEEN_TITLES = set()
+SEEN_KEYS = set()
+
+def normalize_title(title):
+    cleaned = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', (title or '').lower())
+    cleaned = re.sub(r'\b(official|video|audio|lyrics|lyric|hd|4k|hq|song|songs|music|remix|slowed|reverb|status|whatsapp|full)\b', ' ', cleaned)
+    cleaned = re.sub(r'[^a-z0-9\s]', ' ', cleaned)
+    tokens = [t for t in cleaned.split() if len(t) > 1]
+    return " ".join(tokens)
+
+def is_already_played(title, video_id=None):
+    if video_id and video_id in SEEN_IDS:
+        return True
+    norm = normalize_title(title)
+    if norm and norm in SEEN_TITLES:
+        return True
+    # Agar first 3 meaningful words match kar rahe hain toh duplicate/same song maanein
+    words = norm.split()
+    if len(words) >= 2:
+        key_pair = " ".join(words[:2])
+        if key_pair in SEEN_KEYS:
+            return True
+    return False
+
+def mark_played(title, video_id=None, seed_query=None):
+    if video_id:
+        SEEN_IDS.add(video_id)
+    for raw in [title, seed_query]:
+        if not raw:
+            continue
+        norm = normalize_title(raw)
+        if norm:
+            SEEN_TITLES.add(norm)
+            words = norm.split()
+            if len(words) >= 2:
+                SEEN_KEYS.add(" ".join(words[:2]))
+
 def ensure_temp_dir():
     os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
 
@@ -38,7 +77,6 @@ def kill_active_downloads():
         ACTIVE_DOWNLOAD_PROCS.clear()
 
 def cleanup_temp_files(specific_prefix=None):
-    """Deletes played/temporary audio cache files so zero space remains after playback."""
     if not os.path.exists(TEMP_CACHE_DIR):
         return
     try:
@@ -66,7 +104,7 @@ def render_hacker_console(title, mode_label, index_label, next_status="STANDBY")
     display_title = (title[:38] + '...') if len(title) > 41 else title.ljust(41)
 
     print(f"{GREEN}╔══════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{GREEN}║ {WHITE}  [CYBER-AUDIO TERMINAL v4.0] {CYAN}:: {mode_label.ljust(22)} {GREEN}║{RESET}")
+    print(f"{GREEN}║ {WHITE}  [CYBER-AUDIO TERMINAL v4.1] {CYAN}:: {mode_label.ljust(22)} {GREEN}║{RESET}")
     print(f"{GREEN}╠══════════════════════════════════════════════════════════╣{RESET}")
     print(f"{GREEN}║ {DARK_GREEN}SOURCE   : {WHITE}Mirror Note/music.txt                       {GREEN}║{RESET}")
     print(f"{GREEN}║ {DARK_GREEN}STORAGE  : {CYAN}ZERO-SPACE AUTO-PURGE + PRE-FETCH           {GREEN}║{RESET}")
@@ -78,8 +116,7 @@ def render_hacker_console(title, mode_label, index_label, next_status="STANDBY")
     print(f"{GREEN}╚══════════════════════════════════════════════════════════╝{RESET}")
     print(f"{CYAN}[CONTROLS] {WHITE}Next Track: {GREEN}'q'{WHITE} | Pause/Play: {GREEN}'Space'{WHITE} | Exit: {RED}'Ctrl+C'{RESET}\n")
 
-def fetch_title_and_url(query):
-    """Resolves actual video title and direct webpage URL."""
+def fetch_track_meta(query):
     try:
         raw = subprocess.check_output(
             ["yt-dlp", "--no-warnings", "--no-playlist", "-j", "-f", "bestaudio/best", query],
@@ -88,18 +125,17 @@ def fetch_title_and_url(query):
         ).decode("utf-8", errors="ignore").strip()
 
         if not raw:
-            return query, query
+            return query, query, None
 
-        first_line = raw.splitlines()[0]
-        data = json.loads(first_line)
+        data = json.loads(raw.splitlines()[0])
         title = data.get("title") or query
         webpage_url = data.get("webpage_url") or query
-        return webpage_url, title
+        vid_id = data.get("id")
+        return webpage_url, title, vid_id
     except Exception:
-        return query, query
+        return query, query, None
 
 def download_temp_track(target_query, track_tag):
-    """Downloads a single track into temp cache; caller deletes it immediately after play."""
     if STOP_EVENT.is_set():
         return None
 
@@ -144,20 +180,26 @@ def download_temp_track(target_query, track_tag):
             with PROC_LOCK:
                 ACTIVE_DOWNLOAD_PROCS.discard(proc)
 
-def get_auto_suggestions(seed_song, played_titles, limit=8):
-    """Finds related songs based on the single track in music.txt."""
-    suggestions = []
-    search_queries = [
-        f"ytsearch{limit}:{seed_song} song",
-        f"ytsearch{limit}:{seed_song} similar songs mix"
+def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
+    """Finds distinct, non-repeating songs like YouTube Up-Next autoplay."""
+    clean_anchor = normalize_title(anchor_title)
+    words = clean_anchor.split()
+    artist_or_lead = " ".join(words[-2:]) if len(words) >= 2 else clean_anchor
+
+    queries = [
+        f"ytsearch{count}:{artist_or_lead} hits",
+        f"ytsearch{count}:{seed_query} playlist",
+        f"ytsearch{count}:top {artist_or_lead} songs",
+        f"ytsearch{count}:best {clean_anchor[:25]} songs"
     ]
 
-    for sq in search_queries:
+    results = []
+    for q in queries:
         if STOP_EVENT.is_set():
             break
         try:
             raw = subprocess.check_output(
-                ["yt-dlp", "--no-warnings", "--flat-playlist", "-j", sq],
+                ["yt-dlp", "--no-warnings", "--flat-playlist", "-j", q],
                 stderr=subprocess.DEVNULL,
                 timeout=25
             ).decode("utf-8", errors="ignore").strip()
@@ -167,30 +209,41 @@ def get_auto_suggestions(seed_song, played_titles, limit=8):
                     continue
                 info = json.loads(line)
                 title = (info.get("title") or "").strip()
+                vid_id = (info.get("id") or "").strip()
                 url = info.get("url") or info.get("webpage_url")
                 if not title or not url:
                     continue
                 if not url.startswith("http"):
                     url = f"https://www.youtube.com/watch?v={url}"
 
-                norm_title = title.lower()
-                if norm_title not in played_titles and all(norm_title != s[1].lower() for s in suggestions):
-                    suggestions.append((url, title))
-                    if len(suggestions) >= limit:
-                        return suggestions
+                if is_already_played(title, vid_id):
+                    continue
+
+                norm = normalize_title(title)
+                if not norm:
+                    continue
+
+                # Batch ke andar bhi duplicate avoid karein
+                if any(normalize_title(t) == norm for _, t, _ in results):
+                    continue
+
+                results.append((url, title, vid_id))
+                if len(results) >= count:
+                    return results
         except Exception:
             continue
 
-    return suggestions
+    return results
 
 class BackgroundPrefetcher:
-    """Prepares the next track in the background while the current track plays."""
-    def __init__(self, target_query, track_tag, known_title=None):
+    def __init__(self, target_query, track_tag, known_title=None, known_id=None):
         self.target_query = target_query
         self.track_tag = track_tag
         self.known_title = known_title
+        self.known_id = known_id
         self.local_file = None
         self.resolved_title = known_title or target_query
+        self.resolved_id = known_id
         self.done_event = threading.Event()
         self.thread = threading.Thread(target=self._worker, daemon=True)
 
@@ -201,9 +254,11 @@ class BackgroundPrefetcher:
         try:
             if STOP_EVENT.is_set():
                 return
-            url, title = fetch_title_and_url(self.target_query)
+            url, title, vid_id = fetch_track_meta(self.target_query)
             if not self.known_title:
                 self.resolved_title = title
+            if vid_id:
+                self.resolved_id = vid_id
             self.local_file = download_temp_track(url, self.track_tag)
         finally:
             self.done_event.set()
@@ -211,12 +266,11 @@ class BackgroundPrefetcher:
     def wait_and_get(self):
         while not self.done_event.is_set():
             if STOP_EVENT.is_set():
-                return None, self.resolved_title
+                return None, self.resolved_title, self.resolved_id
             time.sleep(0.15)
-        return self.local_file, self.resolved_title
+        return self.local_file, self.resolved_title, self.resolved_id
 
 def play_temp_file_and_purge(local_audio_path, track_tag):
-    """Plays local cached track and immediately deletes it once finished/skipped/stopped."""
     try:
         proc = subprocess.run([
             "mpv",
@@ -231,6 +285,10 @@ def play_temp_file_and_purge(local_audio_path, track_tag):
 
 def play_playlist():
     STOP_EVENT.clear()
+    SEEN_IDS.clear()
+    SEEN_TITLES.clear()
+    SEEN_KEYS.clear()
+
     check_and_update(force=False, silent=True)
     ensure_temp_dir()
     cleanup_temp_files()
@@ -246,113 +304,109 @@ def play_playlist():
         print(f"{YELLOW}[WARN] Playlist empty. Add song names to 'Mirror Note/music.txt'{RESET}")
         return
 
-    played_titles = set()
     track_counter = 1
 
     try:
-        # CASE 1: Single song in music.txt -> Auto-Suggest + Background Pre-Fetch + Auto-Purge
+        # CASE 1: 1 song in music.txt -> YouTube Autoplay Next (Non-Repeating)
         if len(songs) == 1:
             seed_song = songs[0]
-            render_hacker_console(seed_song, "AUTO-SUGGEST SEED", "TRACK [01 / AUTO]", "LOCKING SEED...")
-            print(f"{DARK_GREEN}[*] Loading first track & preparing Auto-Suggest engine...{RESET}")
+            render_hacker_console(seed_song, "YT AUTO-NEXT RADIO", "TRACK [01 / AUTO]", "LOCKING FIRST TRACK...")
+            print(f"{DARK_GREEN}[*] Starting YouTube-style non-repeating radio from '{seed_song}'...{RESET}")
 
             query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
-            resolved_url, actual_title = fetch_title_and_url(query)
-            played_titles.add(actual_title.lower())
-            played_titles.add(seed_song.lower())
+            resolved_url, actual_title, actual_id = fetch_track_meta(query)
+            mark_played(actual_title, actual_id, seed_song)
 
             seed_tag = f"track_{track_counter}"
             track_counter += 1
             seed_file = download_temp_track(resolved_url, seed_tag)
 
-            # First track bajne se pehle hi auto-suggestions fetch karke next track background mein lagayein
-            suggestion_queue = get_auto_suggestions(actual_title, played_titles, limit=8)
-            if not suggestion_queue:
-                suggestion_queue = get_auto_suggestions(seed_song, played_titles, limit=8)
-
+            next_queue = get_youtube_style_next_tracks(actual_title, seed_song, count=10)
             prefetcher = None
-            next_title_preview = "SEARCHING..."
-            if suggestion_queue:
-                next_url, next_title = suggestion_queue.pop(0)
-                played_titles.add(next_title.lower())
-                next_title_preview = f"PRE-FETCHING: {next_title[:26]}"
-                prefetcher = BackgroundPrefetcher(next_url, f"track_{track_counter}", known_title=next_title)
+            next_status = "FINDING NEXT SONG..."
+            current_anchor = actual_title
+
+            if next_queue:
+                nxt_url, nxt_title, nxt_id = next_queue.pop(0)
+                mark_played(nxt_title, nxt_id)
+                current_anchor = nxt_title
+                next_status = f"NEXT: {nxt_title[:32]}"
+                prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title, known_id=nxt_id)
                 track_counter += 1
                 prefetcher.start()
 
             if seed_file:
-                render_hacker_console(actual_title, "AUTO-SUGGEST SEED", "TRACK [01 / AUTO]", next_title_preview)
-                print(f"{GREEN}[✓] Playing now! Next track is pre-fetching in background (0-sec gap).{RESET}\n")
+                render_hacker_console(actual_title, "YT AUTO-NEXT RADIO", "TRACK [01 / AUTO]", next_status)
+                print(f"{GREEN}[✓] Playing now! Next unique song is pre-fetching in background.{RESET}\n")
                 ret = play_temp_file_and_purge(seed_file, seed_tag)
                 if ret not in (0, 4):
                     STOP_EVENT.set()
                     kill_active_downloads()
                     cleanup_temp_files()
-                    print(f"\n{RED}[!] SESSION TERMINATED. ALL TEMP SPACE FREED.{RESET}")
+                    print(f"\n{RED}[!] SESSION TERMINATED. TEMP SPACE FREED.{RESET}")
                     return
             else:
                 cleanup_temp_files(seed_tag)
 
             auto_num = 2
             while not STOP_EVENT.is_set():
-                if not suggestion_queue:
-                    new_sugs = get_auto_suggestions(actual_title, played_titles, limit=8)
-                    if not new_sugs:
-                        played_titles = {actual_title.lower(), seed_song.lower()}
-                        new_sugs = get_auto_suggestions(seed_song, played_titles, limit=8)
-                    suggestion_queue.extend(new_sugs)
+                if len(next_queue) < 3:
+                    more_tracks = get_youtube_style_next_tracks(current_anchor, seed_song, count=10)
+                    next_queue.extend(more_tracks)
 
                 if prefetcher is None:
-                    if not suggestion_queue:
+                    if not next_queue:
                         time.sleep(1)
                         continue
-                    cur_url, cur_title = suggestion_queue.pop(0)
-                    played_titles.add(cur_title.lower())
+                    cur_url, cur_title, cur_id = next_queue.pop(0)
+                    mark_played(cur_title, cur_id)
+                    current_anchor = cur_title
                     cur_tag = f"track_{track_counter}"
                     track_counter += 1
-                    render_hacker_console(cur_title, "AUTO-SUGGESTED", f"SUGGESTED #{auto_num:02d}", "BUFFERING...")
+                    render_hacker_console(cur_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", "BUFFERING...")
                     cur_file = download_temp_track(cur_url, cur_tag)
                 else:
                     cur_tag = prefetcher.track_tag
                     if not prefetcher.done_event.is_set():
-                        render_hacker_console(prefetcher.resolved_title, "AUTO-SUGGESTED", f"SUGGESTED #{auto_num:02d}", "FINISHING CACHE...")
-                    cur_file, cur_title = prefetcher.wait_and_get()
+                        render_hacker_console(prefetcher.resolved_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", "FINISHING CACHE...")
+                    cur_file, cur_title, cur_id = prefetcher.wait_and_get()
+                    mark_played(cur_title, cur_id)
+                    current_anchor = cur_title
 
-                # Agle gaane ko turant background pre-fetch par lagayein
                 next_prefetcher = None
                 next_preview = "QUEUEING NEXT..."
-                if suggestion_queue:
-                    nxt_url, nxt_title = suggestion_queue.pop(0)
-                    played_titles.add(nxt_title.lower())
-                    next_preview = f"READYING: {nxt_title[:30]}"
-                    next_prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title)
+                if next_queue:
+                    nxt_url, nxt_title, nxt_id = next_queue.pop(0)
+                    mark_played(nxt_title, nxt_id)
+                    next_preview = f"NEXT: {nxt_title[:32]}"
+                    next_prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title, known_id=nxt_id)
                     track_counter += 1
                     next_prefetcher.start()
 
                 if cur_file:
-                    render_hacker_console(cur_title, "AUTO-SUGGESTED", f"SUGGESTED #{auto_num:02d}", next_preview)
-                    print(f"{GREEN}[✓] Zero-gap playback active! Played file auto-deletes right after.{RESET}\n")
+                    render_hacker_console(cur_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", next_preview)
+                    print(f"{GREEN}[✓] New song playing! Previous song space already purged.{RESET}\n")
                     ret = play_temp_file_and_purge(cur_file, cur_tag)
                     auto_num += 1
                     if ret not in (0, 4):
                         STOP_EVENT.set()
                         kill_active_downloads()
                         cleanup_temp_files()
-                        print(f"\n{RED}[!] SESSION TERMINATED. ALL TEMP SPACE FREED.{RESET}")
+                        print(f"\n{RED}[!] SESSION TERMINATED. TEMP SPACE FREED.{RESET}")
                         return
                 else:
                     cleanup_temp_files(cur_tag)
-                    print(f"{RED}[✗] Track unavailable, jumping immediately to next...{RESET}")
+                    print(f"{RED}[✗] Unavailable track, skipping to next...{RESET}")
                     time.sleep(0.5)
 
                 prefetcher = next_prefetcher
 
-        # CASE 2: Multiple songs in music.txt -> Zero-Gap Pre-Fetch + Instant Auto-Purge
+        # CASE 2: Multiple songs in music.txt
         else:
             total = len(songs)
             first_query = songs[0] if songs[0].startswith("http") else f"ytsearch1:{songs[0]}"
             render_hacker_console(songs[0], "ZERO-GAP PLAYLIST", f"TRACK [01/{total:02d}]", "LOADING TRACK 1...")
-            first_url, first_title = fetch_title_and_url(first_query)
+            first_url, first_title, first_id = fetch_track_meta(first_query)
             first_tag = f"track_{track_counter}"
             track_counter += 1
             cur_file = download_temp_track(first_url, first_tag)
@@ -363,7 +417,6 @@ def play_playlist():
                 if STOP_EVENT.is_set():
                     break
 
-                # Next song ko background mein pre-fetch karein
                 next_prefetcher = None
                 next_preview = "END OF PLAYLIST"
                 if i + 1 < total:
@@ -393,7 +446,7 @@ def play_playlist():
                     cur_tag = next_prefetcher.track_tag
                     if not next_prefetcher.done_event.is_set():
                         render_hacker_console(songs[i + 1], "ZERO-GAP PLAYLIST", f"TRACK [{i+2:02d}/{total:02d}]", "FINISHING CACHE...")
-                    cur_file, cur_title = next_prefetcher.wait_and_get()
+                    cur_file, cur_title, _ = next_prefetcher.wait_and_get()
 
     except KeyboardInterrupt:
         STOP_EVENT.set()
