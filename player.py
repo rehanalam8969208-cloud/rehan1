@@ -5,6 +5,7 @@ import json
 import time
 import socket
 import curses
+import traceback
 import subprocess
 import threading
 from updater import check_and_update
@@ -150,7 +151,6 @@ def format_sec(sec):
 
 
 def fast_get_stream_url(query):
-    """Fast direct audio URL lookup (-g) without heavy JSON overhead."""
     if STOP_EVENT.is_set():
         return None
     proc = None
@@ -167,7 +167,7 @@ def fast_get_stream_url(query):
         )
         with PROC_LOCK:
             ACTIVE_PROCS.add(proc)
-        out, _ = proc.communicate(timeout=12)
+        out, _ = proc.communicate(timeout=15)
         if STOP_EVENT.is_set():
             return None
         lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip().startswith("http")]
@@ -186,7 +186,6 @@ def fast_get_stream_url(query):
 
 
 def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
-    """Single fast flat search for non-repeating next songs."""
     clean_anchor = normalize_title(anchor_title)
     words = clean_anchor.split()
     artist_or_lead = " ".join(words[-2:]) if len(words) >= 2 else clean_anchor
@@ -203,7 +202,7 @@ def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
         )
         with PROC_LOCK:
             ACTIVE_PROCS.add(proc)
-        out, _ = proc.communicate(timeout=12)
+        out, _ = proc.communicate(timeout=15)
         if STOP_EVENT.is_set():
             return results
 
@@ -244,7 +243,6 @@ def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
 
 
 class FastStreamPrefetcher:
-    """Resolves next track's direct audio stream URL in background for quick NEXT switching."""
     def __init__(self, target_query, title):
         self.target_query = target_query
         self.title = title
@@ -263,8 +261,7 @@ class FastStreamPrefetcher:
             self.done_event.set()
 
     def get_ready_or_fallback(self):
-        # Sirf 0.4s max wait taaki NEXT dabane par delay na ho; na mile toh seedha query/url de
-        self.done_event.wait(timeout=0.4)
+        self.done_event.wait(timeout=0.5)
         return self.stream_url or self.target_query
 
 
@@ -281,30 +278,37 @@ def draw_round_pill(stdscr, row_y, left_x, width, label, color_pair):
     return (left_x, left_x + len(pill_text) - 1, max(0, row_y - 1), min(h - 1, row_y + 1))
 
 
-def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_label):
-    record_to_history(title)
+def start_mpv_for_target(playable_target):
     if os.path.exists(MPV_SOCKET):
         try:
             os.remove(MPV_SOCKET)
         except OSError:
             pass
 
+    # Agar direct stream URL nahi mila ya ytsearch query hai, toh mpv ytdl ko allow rakhein
+    is_raw_stream = (
+        playable_target.startswith("http")
+        and "youtube.com/watch" not in playable_target
+        and "youtu.be/" not in playable_target
+        and "googlevideo.com" not in playable_target
+    )
+
     mpv_args = [
-        "mpv", "--no-video", "--really-quiet", "--cache=yes", "--demuxer-max-bytes=15M"
+        "mpv", "--no-video", "--really-quiet", "--cache=yes", "--demuxer-max-bytes=15M",
+        f"--input-ipc-server={MPV_SOCKET}"
     ]
-    # Agar direct http stream URL pehle se mil chuka hai toh ytdl دوبارہ nahi chalega (aur fast start hoga)
-    if playable_target.startswith("http") and "youtube.com/watch" not in playable_target and "youtu.be/" not in playable_target:
+    if is_raw_stream:
         mpv_args.append("--ytdl=no")
     else:
-        mpv_args.append("--ytdl-format=bestaudio[ext=m4a]/bestaudio/best")
+        mpv_args.extend(["--ytdl=yes", "--ytdl-format=bestaudio[ext=m4a]/bestaudio/best"])
 
-    mpv_args.extend([f"--input-ipc-server={MPV_SOCKET}", playable_target])
+    mpv_args.append(playable_target)
+    return subprocess.Popen(mpv_args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    mpv_proc = subprocess.Popen(
-        mpv_args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
+
+def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_label):
+    record_to_history(title)
+    mpv_proc = start_mpv_for_target(playable_target)
     with PROC_LOCK:
         ACTIVE_PROCS.add(mpv_proc)
 
@@ -412,7 +416,6 @@ def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_l
     finally:
         with PROC_LOCK:
             ACTIVE_PROCS.discard(mpv_proc)
-        # Turant mpv band karein taaki NEXT mein der na ho
         if mpv_proc.poll() is None:
             try:
                 mpv_proc.kill()
@@ -446,25 +449,43 @@ def curses_main(stdscr, history_mode=False):
 
     ensure_history_file()
 
+    def show_status(msg):
+        stdscr.erase()
+        _, w = stdscr.getmaxyx()
+        stdscr.addstr(1, 1, "[CYBER-FAST PLAYER] LOADING..."[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(3, 1, msg[:max(1, w - 2)], curses.color_pair(3))
+        stdscr.refresh()
+
     try:
         if history_mode:
             if not os.path.exists(HISTORY_TXT_PATH):
+                show_status("history.txt nahi mila. Press any key...")
+                stdscr.nodelay(False)
+                stdscr.getch()
                 return
             with open(HISTORY_TXT_PATH, "r", encoding="utf-8") as f:
                 songs = [line.strip() for line in f if line.strip()]
             if not songs:
+                show_status("history.txt khali hai. Press any key...")
+                stdscr.nodelay(False)
+                stdscr.getch()
                 return
             mode_title = "HISTORY PLAYBACK"
         else:
             if not os.path.exists(MUSIC_TXT_PATH):
+                show_status("music.txt nahi mila. Press any key...")
+                stdscr.nodelay(False)
+                stdscr.getch()
                 return
             with open(MUSIC_TXT_PATH, "r", encoding="utf-8") as f:
                 songs = [line.strip() for line in f if line.strip()]
             if not songs:
+                show_status("music.txt khali hai. Press any key...")
+                stdscr.nodelay(False)
+                stdscr.getch()
                 return
             mode_title = "YT AUTO-NEXT RADIO" if len(songs) == 1 else "FAST PLAYLIST"
 
-        # Single song -> Fast start + Auto-Next Radio + PREV support
         if not history_mode and len(songs) == 1:
             seed_song = songs[0]
             first_query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
@@ -516,7 +537,6 @@ def curses_main(stdscr, history_mode=False):
 
                 current_anchor = cur_title
 
-                # Agle gaane ka stream link turant background mein nikalna shuru karein
                 next_prefetcher = None
                 next_status = "Queueing..."
                 if next_queue:
@@ -542,7 +562,6 @@ def curses_main(stdscr, history_mode=False):
 
                 prefetcher = next_prefetcher
 
-        # Multiple songs or History list -> Fast start + Pre-fetch + PREV support
         else:
             total = len(songs)
             items = [
@@ -581,6 +600,17 @@ def curses_main(stdscr, history_mode=False):
                 idx += 1
                 prefetcher = next_prefetcher
 
+    except Exception:
+        err_text = traceback.format_exc()
+        stdscr.nodelay(False)
+        stdscr.erase()
+        _, w = stdscr.getmaxyx()
+        stdscr.addstr(0, 1, "[PLAYER ERROR - PRESS ANY KEY TO EXIT]"[:max(1, w - 2)], curses.color_pair(2) | curses.A_BOLD)
+        for line_i, line_str in enumerate(err_text.splitlines()[:20], start=2):
+            if line_i < stdscr.getmaxyx()[0] - 1:
+                stdscr.addstr(line_i, 1, line_str[:max(1, w - 2)], curses.color_pair(3))
+        stdscr.refresh()
+        stdscr.getch()
     finally:
         STOP_EVENT.set()
         kill_all_child_procs()
