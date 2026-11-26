@@ -25,6 +25,17 @@ SEEN_KEYS = set()
 SESSION_TRACKS = []
 
 
+def auto_sync_and_restart_if_needed():
+    """Checks GitHub on every 'play' start; pulls updates and restarts player.py cleanly."""
+    if os.environ.get("REHAN_PLAYER_UPDATED") == "1":
+        return
+    updated = check_and_update(force=True, silent=True)
+    if updated:
+        env = os.environ.copy()
+        env["REHAN_PLAYER_UPDATED"] = "1"
+        os.execve(sys.executable, [sys.executable] + sys.argv, env)
+
+
 def normalize_title(title):
     cleaned = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', (title or '').lower())
     cleaned = re.sub(
@@ -568,7 +579,7 @@ def curses_main(stdscr):
 
 
 if __name__ == "__main__":
-    check_and_update(force=False, silent=True)
+    auto_sync_and_restart_if_needed()
     try:
         curses.wrapper(curses_main)
     except KeyboardInterrupt:
