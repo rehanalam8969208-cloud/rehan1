@@ -26,7 +26,7 @@ HISTORY_LOCK = threading.Lock()
 SEEN_IDS = set()
 SEEN_TITLES = set()
 SEEN_KEYS = set()
-SESSION_TRACKS = []  # List of dicts: {"url": ..., "title": ..., "id": ...}
+SESSION_TRACKS = []
 
 
 def ensure_history_file():
@@ -307,24 +307,23 @@ class BackgroundPrefetcher:
         return self.local_file, self.resolved_title, self.resolved_id
 
 
-def draw_button_box(stdscr, top_y, left_x, width, label, color_pair):
-    """Draws a crisp, readable 3-line touch button block."""
+def draw_round_pill(stdscr, row_y, left_x, width, label, color_pair):
+    """Draws a clean round-pill style touch button with clear edges and spacing."""
     h, w = stdscr.getmaxyx()
-    if top_y + 2 >= h or left_x + width >= w or left_x < 0:
+    if row_y >= h or left_x + width > w or left_x < 0 or width < 4:
         return None
-    inner = max(1, width - 2)
-    centered = label.center(inner)[:inner]
+    inner = width - 2
+    pill_text = f"({label.center(inner)[:inner]})"
     try:
-        stdscr.addstr(top_y, left_x, "+" + "-" * inner + "+", color_pair)
-        stdscr.addstr(top_y + 1, left_x, "|" + centered + "|", color_pair | curses.A_BOLD)
-        stdscr.addstr(top_y + 2, left_x, "+" + "-" * inner + "+", color_pair)
+        stdscr.addstr(row_y, left_x, pill_text, color_pair | curses.A_BOLD)
     except curses.error:
         pass
-    return (left_x, left_x + width - 1, top_y, top_y + 2)
+    # Touch area thoda generous rakha hai taaki tap aasani se detect ho
+    return (left_x, left_x + len(pill_text) - 1, max(0, row_y - 1), min(h - 1, row_y + 1))
 
 
 def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, queue_label, next_label):
-    """Plays cached audio in mpv with clear, large touch buttons including PREV."""
+    """Plays cached audio in mpv with clean round-pill touch controls and spacing."""
     record_to_history(title)
     if os.path.exists(MPV_SOCKET):
         try:
@@ -357,53 +356,54 @@ def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, q
             dur = get_mpv_prop("duration", 0) or 0
 
             stdscr.addstr(0, 1, f"[CYBER-TOUCH PLAYER] :: {mode_label}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(1, 1, ("-" * max(1, w - 2)), curses.color_pair(2))
-            stdscr.addstr(3, 1, f"QUEUE   : {queue_label}"[:max(1, w - 2)], curses.color_pair(3))
-            stdscr.addstr(4, 1, f"NEXT-UP : {next_label}"[:max(1, w - 2)], curses.color_pair(4))
-            stdscr.addstr(6, 1, f"NOW PLAYING ({'PAUSED' if paused else 'PLAYING'}):"[:max(1, w - 2)], curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(7, 1, f"> {title}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(1, 1, ("." * max(1, w - 2)), curses.color_pair(2))
+            stdscr.addstr(3, 1, f"QUEUE   : {queue_label}"[:max(1, w - 2)], curses.color_pair(1))
+            stdscr.addstr(4, 1, f"NEXT-UP : {next_label}"[:max(1, w - 2)], curses.color_pair(3))
+            stdscr.addstr(6, 1, f"NOW PLAYING ({'PAUSED' if paused else 'ACTIVE'}):"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(7, 1, f"> {title}"[:max(1, w - 2)], curses.color_pair(4) | curses.A_BOLD)
 
             # Progress Bar
-            bar_y = max(9, min(h - 10, 10))
+            bar_y = 9
             bar_w = max(8, w - 18)
             ratio = min(1.0, max(0.0, (pos / dur))) if dur > 0 else 0
             filled = int(bar_w * ratio)
-            bar_str = "#" * filled + "-" * (bar_w - filled)
-            stdscr.addstr(bar_y, 1, f"{format_sec(pos)} [{bar_str}] {format_sec(dur)}"[:max(1, w - 2)], curses.color_pair(1))
+            bar_str = "=" * filled + "-" * (bar_w - filled)
+            if bar_y < h:
+                stdscr.addstr(bar_y, 1, f"{format_sec(pos)} [{bar_str}] {format_sec(dur)}"[:max(1, w - 2)], curses.color_pair(1))
 
-            # Clear 2-Row Touch Control Panel near Bottom
-            row1_y = max(bar_y + 2, h - 8)
+            # Spaced-out Round Pill Touch Controls
+            row1_y = max(bar_y + 3, h - 7)
             row2_y = row1_y + 3
             play_lbl = "PLAY" if paused else "PAUSE"
 
             btn_regions = []
-            avail_w = max(24, w - 2)
+            avail_w = max(24, w - 4)
+            gap = 3  # Buttons ke beech saaf gap
 
-            # Row 1: PREV | PAUSE/PLAY | NEXT
+            # Row 1: ( PREV )   ( PAUSE/PLAY )   ( NEXT )
             r1_defs = [("prv", "PREV"), ("tog", play_lbl), ("nxt", "NEXT")]
-            gap = 1
-            bw1 = max(7, (avail_w - gap * (len(r1_defs) - 1)) // len(r1_defs))
-            cx = 1
+            bw1 = max(8, (avail_w - gap * (len(r1_defs) - 1)) // len(r1_defs))
+            cx = 2
             for act, lbl in r1_defs:
-                box = draw_button_box(stdscr, row1_y, cx, bw1, lbl, curses.color_pair(7))
+                box = draw_round_pill(stdscr, row1_y, cx, bw1, lbl, curses.color_pair(1))
                 if box:
                     btn_regions.append((box, act))
                 cx += bw1 + gap
 
-            # Row 2: -10s | +10s | STOP
+            # Row 2: ( -10s )   ( +10s )   ( STOP )
             r2_defs = [("rew", "-10s"), ("fwd", "+10s"), ("stp", "STOP")]
-            bw2 = max(7, (avail_w - gap * (len(r2_defs) - 1)) // len(r2_defs))
-            cx = 1
+            bw2 = max(8, (avail_w - gap * (len(r2_defs) - 1)) // len(r2_defs))
+            cx = 2
             for act, lbl in r2_defs:
-                cp = curses.color_pair(5) if act == "stp" else curses.color_pair(7)
-                box = draw_button_box(stdscr, row2_y, cx, bw2, lbl, cp)
+                cp = curses.color_pair(2) if act == "stp" else curses.color_pair(3)
+                box = draw_round_pill(stdscr, row2_y, cx, bw2, lbl, cp)
                 if box:
                     btn_regions.append((box, act))
                 cx += bw2 + gap
 
-            hint_y = min(h - 1, row2_y + 3)
+            hint_y = row2_y + 2
             if hint_y < h:
-                stdscr.addstr(hint_y, 1, "Tap buttons or keys: [b]=Prev [Space]=Pause [q]=Next [x]=Stop"[:max(1, w - 2)], curses.color_pair(3))
+                stdscr.addstr(hint_y, 2, "Keys: [b]=Prev  [Space]=Pause  [q]=Next  [x]=Stop"[:max(1, w - 3)], curses.color_pair(4))
 
             stdscr.refresh()
 
@@ -482,12 +482,11 @@ def curses_main(stdscr, history_mode=False):
 
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_GREEN, -1)
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_CYAN, -1)
+    # Clean transparent/dark background colors (no harsh solid green boxes)
+    curses.init_pair(1, curses.COLOR_CYAN, -1)
+    curses.init_pair(2, curses.COLOR_RED, -1)
+    curses.init_pair(3, curses.COLOR_WHITE, -1)
     curses.init_pair(4, curses.COLOR_YELLOW, -1)
-    curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_RED)
-    curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_GREEN)
 
     STOP_EVENT.clear()
     SEEN_IDS.clear()
@@ -526,7 +525,6 @@ def curses_main(stdscr, history_mode=False):
 
         track_counter = 1
 
-        # Single song -> YouTube Auto-Next Radio with PREV support
         if not history_mode and len(songs) == 1:
             seed_song = songs[0]
             show_loading(f"Loading seed track: {seed_song}...")
@@ -621,7 +619,6 @@ def curses_main(stdscr, history_mode=False):
 
                 prefetcher = next_prefetcher
 
-        # Playlist or History with PREV support
         else:
             total = len(songs)
             resolved_list = []
