@@ -15,13 +15,18 @@ def refresh_aliases():
         f'alias imp4="python \'{REPO_DIR}/downloader.py\' insta mp4"',
         f'alias imp3="python \'{REPO_DIR}/downloader.py\' insta mp3"',
         f'alias play="python \'{REPO_DIR}/player.py\'"',
+        f'alias H="python \'{REPO_DIR}/player.py\' --history"',
+        f'alias h="python \'{REPO_DIR}/player.py\' --history"',
         f'alias sync="python \'{REPO_DIR}/updater.py\' --force"'
     ]
     try:
         lines = []
         if os.path.exists(bashrc_path):
             with open(bashrc_path, "r", encoding="utf-8") as f:
-                skip_keys = ("alias ymp4=", "alias ymp3=", "alias imp4=", "alias imp3=", "alias play=", "alias sync=", "alias upload=")
+                skip_keys = (
+                    "alias ymp4=", "alias ymp3=", "alias imp4=", "alias imp3=",
+                    "alias play=", "alias sync=", "alias h=", "alias H=", "alias upload="
+                )
                 lines = [line for line in f if not any(k in line for k in skip_keys)]
         with open(bashrc_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
@@ -59,7 +64,6 @@ def check_and_update(force=False, silent=True):
     mark_checked()
 
     try:
-        # Local untracked cache/pyc files ke conflicts se bachne ke liye fetch + reset/pull
         subprocess.run(["git", "-C", REPO_DIR, "fetch", "--quiet"], timeout=12, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         local_head = subprocess.check_output(["git", "-C", REPO_DIR, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL).decode().strip()
         remote_head = subprocess.check_output(["git", "-C", REPO_DIR, "rev-parse", "@{u}"], stderr=subprocess.DEVNULL).decode().strip()
