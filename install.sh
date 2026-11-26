@@ -4,7 +4,6 @@ NEON_GREEN="\e[38;5;46m"
 DARK_GREEN="\e[38;5;28m"
 CYAN="\e[38;5;51m"
 WHITE="\e[1;37m"
-RED="\e[38;5;196m"
 RESET="\e[0m"
 
 clear
@@ -36,13 +35,13 @@ mkdir -p "/storage/emulated/0/Mirror Note"
 touch "/storage/emulated/0/Mirror Note/youtube.txt"
 touch "/storage/emulated/0/Mirror Note/insta.txt"
 touch "/storage/emulated/0/Mirror Note/music.txt"
-touch "/storage/emulated/0/Mirror Note/history.txt"
+rm -f "/storage/emulated/0/Mirror Note/history.txt"
 
 echo -e "${CYAN}[*] Configuring Termux Bottom Touch Keys (~/.termux/termux.properties)...${RESET}"
 mkdir -p ~/.termux
 cat << 'EOF' > ~/.termux/termux.properties
 extra-keys = [ \
-  [{macro: "SPACE", display: "⏯ PLAY/PAUSE"}, {macro: "q", display: "⏭ NEXT"}, {macro: "LEFT", display: "⏪ -10s"}, {macro: "RIGHT", display: "⏩ +10s"}, {macro: "CTRL c", display: "⏹ STOP"}], \
+  [{macro: "SPACE", display: "PLAY/PAUSE"}, {macro: "q", display: "NEXT"}, {macro: "b", display: "PREV"}, {macro: "LEFT", display: "-10s"}, {macro: "RIGHT", display: "+10s"}, {macro: "x", display: "STOP"}], \
   ['ESC', 'TAB', 'CTRL', 'ALT', 'UP', 'DOWN'] \
 ]
 EOF
@@ -56,18 +55,14 @@ sed -i '/alias ymp3=/d' ~/.bashrc
 sed -i '/alias ymp4=/d' ~/.bashrc
 sed -i '/alias play=/d' ~/.bashrc
 sed -i '/alias sync=/d' ~/.bashrc
+sed -i '/alias dw=/d' ~/.bashrc
 sed -i '/alias h=/d' ~/.bashrc
 sed -i '/alias H=/d' ~/.bashrc
 sed -i '/alias upload=/d' ~/.bashrc
 
 REPO_DIR=$(pwd)
-echo "alias ymp4=\"python '$REPO_DIR/downloader.py' youtube mp4\"" >> ~/.bashrc
-echo "alias ymp3=\"python '$REPO_DIR/downloader.py' youtube mp3\"" >> ~/.bashrc
-echo "alias imp4=\"python '$REPO_DIR/downloader.py' insta mp4\"" >> ~/.bashrc
-echo "alias imp3=\"python '$REPO_DIR/downloader.py' insta mp3\"" >> ~/.bashrc
+echo "alias dw=\"python '$REPO_DIR/dw.py'\"" >> ~/.bashrc
 echo "alias play=\"python '$REPO_DIR/player.py'\"" >> ~/.bashrc
-echo "alias H=\"python '$REPO_DIR/player.py' --history\"" >> ~/.bashrc
-echo "alias h=\"python '$REPO_DIR/player.py' --history\"" >> ~/.bashrc
 echo "alias sync=\"python '$REPO_DIR/updater.py' --force\"" >> ~/.bashrc
 
 echo -e "\n${NEON_GREEN}╔════════════════════════════════════════════════════╗${RESET}"
