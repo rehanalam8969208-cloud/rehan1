@@ -38,6 +38,16 @@ touch "/storage/emulated/0/Mirror Note/insta.txt"
 touch "/storage/emulated/0/Mirror Note/music.txt"
 touch "/storage/emulated/0/Mirror Note/history.txt"
 
+echo -e "${CYAN}[*] Configuring Termux Bottom Touch Keys (~/.termux/termux.properties)...${RESET}"
+mkdir -p ~/.termux
+cat << 'EOF' > ~/.termux/termux.properties
+extra-keys = [ \
+  [{macro: "SPACE", display: "⏯ PLAY/PAUSE"}, {macro: "q", display: "⏭ NEXT"}, {macro: "LEFT", display: "⏪ -10s"}, {macro: "RIGHT", display: "⏩ +10s"}, {macro: "CTRL c", display: "⏹ STOP"}], \
+  ['ESC', 'TAB', 'CTRL', 'ALT', 'UP', 'DOWN'] \
+]
+EOF
+termux-reload-settings >/dev/null 2>&1 || true
+
 echo -e "${NEON_GREEN}[+] Injecting Cyber Aliases & Auto-Sync into ~/.bashrc...${RESET}"
 touch ~/.bashrc
 sed -i '/alias imp3=/d' ~/.bashrc
