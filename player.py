@@ -18,16 +18,50 @@ RED = '\033[38;5;196m'
 YELLOW = '\033[38;5;226m'
 RESET = '\033[0m'
 
-MUSIC_TXT_PATH = "/storage/emulated/0/Mirror Note/music.txt"
+BASE_NOTES_DIR = "/storage/emulated/0/Mirror Note"
+MUSIC_TXT_PATH = os.path.join(BASE_NOTES_DIR, "music.txt")
+HISTORY_TXT_PATH = os.path.join(BASE_NOTES_DIR, "history.txt")
 TEMP_CACHE_DIR = os.path.join(os.environ.get("TMPDIR", "/data/data/com.termux/files/usr/tmp"), "mirror_note_audio_cache")
 
 STOP_EVENT = threading.Event()
 ACTIVE_DOWNLOAD_PROCS = set()
 PROC_LOCK = threading.Lock()
+HISTORY_LOCK = threading.Lock()
 
 SEEN_IDS = set()
 SEEN_TITLES = set()
 SEEN_KEYS = set()
+
+def ensure_history_file():
+    try:
+        os.makedirs(BASE_NOTES_DIR, exist_ok=True)
+        if not os.path.exists(HISTORY_TXT_PATH):
+            with open(HISTORY_TXT_PATH, "w", encoding="utf-8") as f:
+                f.write("")
+    except Exception:
+        pass
+
+def record_to_history(song_title):
+    """Automatically saves every played song at the top of Mirror Note/history.txt without duplicates."""
+    clean_entry = (song_title or "").strip()
+    if not clean_entry:
+        return
+    with HISTORY_LOCK:
+        try:
+            ensure_history_file()
+            existing = []
+            if os.path.exists(HISTORY_TXT_PATH):
+                with open(HISTORY_TXT_PATH, "r", encoding="utf-8") as f:
+                    existing = [line.strip() for line in f if line.strip()]
+
+            # Purana duplicate hata kar latest bajaye gaye gaane ko sabse upar rakhein
+            filtered = [line for line in existing if line.lower() != clean_entry.lower()]
+            updated = [clean_entry] + filtered[:499]  # Max 500 recent songs history
+
+            with open(HISTORY_TXT_PATH, "w", encoding="utf-8") as f:
+                f.write("\n".join(updated) + "\n")
+        except Exception:
+            pass
 
 def normalize_title(title):
     cleaned = re.sub(r'\[[^\]]*\]|\([^\)]*\)', ' ', (title or '').lower())
@@ -42,7 +76,6 @@ def is_already_played(title, video_id=None):
     norm = normalize_title(title)
     if norm and norm in SEEN_TITLES:
         return True
-    # Agar first 3 meaningful words match kar rahe hain toh duplicate/same song maanein
     words = norm.split()
     if len(words) >= 2:
         key_pair = " ".join(words[:2])
@@ -99,22 +132,22 @@ def cleanup_temp_files(specific_prefix=None):
     except Exception:
         pass
 
-def render_hacker_console(title, mode_label, index_label, next_status="STANDBY"):
+def render_hacker_console(title, mode_label, index_label, next_status="STANDBY", source_label="Mirror Note/music.txt"):
     os.system('clear')
     display_title = (title[:38] + '...') if len(title) > 41 else title.ljust(41)
 
     print(f"{GREEN}╔══════════════════════════════════════════════════════════╗{RESET}")
-    print(f"{GREEN}║ {WHITE}  [CYBER-AUDIO TERMINAL v4.1] {CYAN}:: {mode_label.ljust(22)} {GREEN}║{RESET}")
+    print(f"{GREEN}║ {WHITE}  [CYBER-AUDIO TERMINAL v4.5] {CYAN}:: {mode_label.ljust(22)} {GREEN}║{RESET}")
     print(f"{GREEN}╠══════════════════════════════════════════════════════════╣{RESET}")
-    print(f"{GREEN}║ {DARK_GREEN}SOURCE   : {WHITE}Mirror Note/music.txt                       {GREEN}║{RESET}")
-    print(f"{GREEN}║ {DARK_GREEN}STORAGE  : {CYAN}ZERO-SPACE AUTO-PURGE + PRE-FETCH           {GREEN}║{RESET}")
+    print(f"{GREEN}║ {DARK_GREEN}SOURCE   : {WHITE}{source_label.ljust(45)} {GREEN}║{RESET}")
+    print(f"{GREEN}║ {DARK_GREEN}HISTORY  : {CYAN}AUTO-LOGGING -> Mirror Note/history.txt       {GREEN}║{RESET}")
     print(f"{GREEN}║ {DARK_GREEN}NEXT-UP  : {YELLOW}{next_status.ljust(45)} {GREEN}║{RESET}")
     print(f"{GREEN}║ {DARK_GREEN}QUEUE    : {CYAN}{index_label.ljust(45)} {GREEN}║{RESET}")
     print(f"{GREEN}║ {DARK_GREEN}PAYLOAD  : {GREEN}{display_title}     {GREEN}║{RESET}")
     print(f"{GREEN}╠══════════════════════════════════════════════════════════╣{RESET}")
     print(f"{GREEN}║ {DARK_GREEN}SIGNAL   : {GREEN}▂▄▆█▇▅▃▂▅▇█▆▄▂▁▃▆█▇▅▃▂▄▆█▇▅▃▂▅▇█▆▄▂▁▃▆█▇▅ {GREEN}║{RESET}")
     print(f"{GREEN}╚══════════════════════════════════════════════════════════╝{RESET}")
-    print(f"{CYAN}[CONTROLS] {WHITE}Next Track: {GREEN}'q'{WHITE} | Pause/Play: {GREEN}'Space'{WHITE} | Exit: {RED}'Ctrl+C'{RESET}\n")
+    print(f"{CYAN}[CONTROLS] {WHITE}Next: {GREEN}'q'{WHITE} | Pause: {GREEN}'Space'{WHITE} | History Mode: {GREEN}'H'{WHITE} | Exit: {RED}'Ctrl+C'{RESET}\n")
 
 def fetch_track_meta(query):
     try:
@@ -181,7 +214,6 @@ def download_temp_track(target_query, track_tag):
                 ACTIVE_DOWNLOAD_PROCS.discard(proc)
 
 def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
-    """Finds distinct, non-repeating songs like YouTube Up-Next autoplay."""
     clean_anchor = normalize_title(anchor_title)
     words = clean_anchor.split()
     artist_or_lead = " ".join(words[-2:]) if len(words) >= 2 else clean_anchor
@@ -223,7 +255,6 @@ def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
                 if not norm:
                     continue
 
-                # Batch ke andar bhi duplicate avoid karein
                 if any(normalize_title(t) == norm for _, t, _ in results):
                     continue
 
@@ -270,7 +301,9 @@ class BackgroundPrefetcher:
             time.sleep(0.15)
         return self.local_file, self.resolved_title, self.resolved_id
 
-def play_temp_file_and_purge(local_audio_path, track_tag):
+def play_temp_file_and_purge(local_audio_path, track_tag, song_title_for_history):
+    # Gaana bajte hi history.txt mein save karein
+    record_to_history(song_title_for_history)
     try:
         proc = subprocess.run([
             "mpv",
@@ -283,34 +316,99 @@ def play_temp_file_and_purge(local_audio_path, track_tag):
     finally:
         cleanup_temp_files(track_tag)
 
-def play_playlist():
+def play_list_tracks(songs, mode_title, source_label):
+    track_counter = 1
+    total = len(songs)
+    first_query = songs[0] if songs[0].startswith("http") else f"ytsearch1:{songs[0]}"
+    render_hacker_console(songs[0], mode_title, f"TRACK [01/{total:02d}]", "LOADING TRACK 1...", source_label)
+    first_url, first_title, _ = fetch_track_meta(first_query)
+    first_tag = f"track_{track_counter}"
+    track_counter += 1
+    cur_file = download_temp_track(first_url, first_tag)
+    cur_title = first_title
+    cur_tag = first_tag
+
+    for i in range(total):
+        if STOP_EVENT.is_set():
+            break
+
+        next_prefetcher = None
+        next_preview = "END OF QUEUE"
+        if i + 1 < total:
+            nxt_song = songs[i + 1]
+            nxt_query = nxt_song if nxt_song.startswith("http") else f"ytsearch1:{nxt_song}"
+            next_preview = f"PRE-FETCHING: {nxt_song[:26]}"
+            next_prefetcher = BackgroundPrefetcher(nxt_query, f"track_{track_counter}")
+            track_counter += 1
+            next_prefetcher.start()
+
+        if cur_file:
+            render_hacker_console(cur_title, mode_title, f"TRACK [{i+1:02d}/{total:02d}]", next_preview, source_label)
+            print(f"{GREEN}[✓] Playing & saved to history.txt (Temp space auto-purges after play).{RESET}\n")
+            ret = play_temp_file_and_purge(cur_file, cur_tag, cur_title)
+            if ret not in (0, 4):
+                STOP_EVENT.set()
+                kill_active_downloads()
+                cleanup_temp_files()
+                print(f"\n{RED}[!] SESSION TERMINATED. ALL TEMP SPACE FREED.{RESET}")
+                break
+        else:
+            cleanup_temp_files(cur_tag)
+            print(f"{RED}[✗] Failed to load '{cur_title}'. Moving to next...{RESET}")
+            time.sleep(0.8)
+
+        if next_prefetcher is not None:
+            cur_tag = next_prefetcher.track_tag
+            if not next_prefetcher.done_event.is_set():
+                render_hacker_console(songs[i + 1], mode_title, f"TRACK [{i+2:02d}/{total:02d}]", "FINISHING CACHE...", source_label)
+            cur_file, cur_title, _ = next_prefetcher.wait_and_get()
+
+def play_playlist(history_mode=False):
     STOP_EVENT.clear()
     SEEN_IDS.clear()
     SEEN_TITLES.clear()
     SEEN_KEYS.clear()
 
     check_and_update(force=False, silent=True)
+    ensure_history_file()
     ensure_temp_dir()
     cleanup_temp_files()
 
-    if not os.path.exists(MUSIC_TXT_PATH):
-        print(f"{RED}[ERROR] Playlist file missing: {MUSIC_TXT_PATH}{RESET}")
-        return
-
-    with open(MUSIC_TXT_PATH, "r", encoding="utf-8") as f:
-        songs = [line.strip() for line in f if line.strip()]
-
-    if not songs:
-        print(f"{YELLOW}[WARN] Playlist empty. Add song names to 'Mirror Note/music.txt'{RESET}")
-        return
-
-    track_counter = 1
-
     try:
-        # CASE 1: 1 song in music.txt -> YouTube Autoplay Next (Non-Repeating)
+        # HISTORY MODE ('H' ya 'h' command se chalne par)
+        if history_mode:
+            if not os.path.exists(HISTORY_TXT_PATH):
+                print(f"{RED}[ERROR] History file missing: {HISTORY_TXT_PATH}{RESET}")
+                return
+
+            with open(HISTORY_TXT_PATH, "r", encoding="utf-8") as f:
+                history_songs = [line.strip() for line in f if line.strip()]
+
+            if not history_songs:
+                print(f"{YELLOW}[WARN] History abhi khali hai! Pehle 'play' se kuch gaane bajayein.{RESET}")
+                return
+
+            play_list_tracks(history_songs, "HISTORY PLAYBACK", "Mirror Note/history.txt")
+            return
+
+        # NORMAL / AUTO-NEXT MODE ('play' command se chalne par)
+        if not os.path.exists(MUSIC_TXT_PATH):
+            print(f"{RED}[ERROR] Playlist file missing: {MUSIC_TXT_PATH}{RESET}")
+            return
+
+        with open(MUSIC_TXT_PATH, "r", encoding="utf-8") as f:
+            songs = [line.strip() for line in f if line.strip()]
+
+        if not songs:
+            print(f"{YELLOW}[WARN] Playlist empty. Add song names to 'Mirror Note/music.txt'{RESET}")
+            return
+
+        track_counter = 1
+
+        # CASE 1: 1 song in music.txt -> YouTube Auto-Next Radio + Auto-History
         if len(songs) == 1:
             seed_song = songs[0]
-            render_hacker_console(seed_song, "YT AUTO-NEXT RADIO", "TRACK [01 / AUTO]", "LOCKING FIRST TRACK...")
+            render_hacker_console(seed_song, "YT AUTO-NEXT RADIO", "TRACK [01 / AUTO]", "LOCKING FIRST TRACK...", "Mirror Note/music.txt")
             print(f"{DARK_GREEN}[*] Starting YouTube-style non-repeating radio from '{seed_song}'...{RESET}")
 
             query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
@@ -336,9 +434,9 @@ def play_playlist():
                 prefetcher.start()
 
             if seed_file:
-                render_hacker_console(actual_title, "YT AUTO-NEXT RADIO", "TRACK [01 / AUTO]", next_status)
-                print(f"{GREEN}[✓] Playing now! Next unique song is pre-fetching in background.{RESET}\n")
-                ret = play_temp_file_and_purge(seed_file, seed_tag)
+                render_hacker_console(actual_title, "YT AUTO-NEXT RADIO", "TRACK [01 / AUTO]", next_status, "Mirror Note/music.txt")
+                print(f"{GREEN}[✓] Playing now & logged to history.txt! Next unique song pre-fetching...{RESET}\n")
+                ret = play_temp_file_and_purge(seed_file, seed_tag, actual_title)
                 if ret not in (0, 4):
                     STOP_EVENT.set()
                     kill_active_downloads()
@@ -363,12 +461,12 @@ def play_playlist():
                     current_anchor = cur_title
                     cur_tag = f"track_{track_counter}"
                     track_counter += 1
-                    render_hacker_console(cur_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", "BUFFERING...")
+                    render_hacker_console(cur_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", "BUFFERING...", "Mirror Note/music.txt")
                     cur_file = download_temp_track(cur_url, cur_tag)
                 else:
                     cur_tag = prefetcher.track_tag
                     if not prefetcher.done_event.is_set():
-                        render_hacker_console(prefetcher.resolved_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", "FINISHING CACHE...")
+                        render_hacker_console(prefetcher.resolved_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", "FINISHING CACHE...", "Mirror Note/music.txt")
                     cur_file, cur_title, cur_id = prefetcher.wait_and_get()
                     mark_played(cur_title, cur_id)
                     current_anchor = cur_title
@@ -384,9 +482,9 @@ def play_playlist():
                     next_prefetcher.start()
 
                 if cur_file:
-                    render_hacker_console(cur_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", next_preview)
-                    print(f"{GREEN}[✓] New song playing! Previous song space already purged.{RESET}\n")
-                    ret = play_temp_file_and_purge(cur_file, cur_tag)
+                    render_hacker_console(cur_title, "YT AUTO-NEXT RADIO", f"AUTO-NEXT #{auto_num:02d}", next_preview, "Mirror Note/music.txt")
+                    print(f"{GREEN}[✓] Playing & saved to history.txt! Previous space already purged.{RESET}\n")
+                    ret = play_temp_file_and_purge(cur_file, cur_tag, cur_title)
                     auto_num += 1
                     if ret not in (0, 4):
                         STOP_EVENT.set()
@@ -401,52 +499,9 @@ def play_playlist():
 
                 prefetcher = next_prefetcher
 
-        # CASE 2: Multiple songs in music.txt
+        # CASE 2: Multiple songs in music.txt -> Normal Zero-Gap Playlist + Auto-History
         else:
-            total = len(songs)
-            first_query = songs[0] if songs[0].startswith("http") else f"ytsearch1:{songs[0]}"
-            render_hacker_console(songs[0], "ZERO-GAP PLAYLIST", f"TRACK [01/{total:02d}]", "LOADING TRACK 1...")
-            first_url, first_title, first_id = fetch_track_meta(first_query)
-            first_tag = f"track_{track_counter}"
-            track_counter += 1
-            cur_file = download_temp_track(first_url, first_tag)
-            cur_title = first_title
-            cur_tag = first_tag
-
-            for i in range(total):
-                if STOP_EVENT.is_set():
-                    break
-
-                next_prefetcher = None
-                next_preview = "END OF PLAYLIST"
-                if i + 1 < total:
-                    nxt_song = songs[i + 1]
-                    nxt_query = nxt_song if nxt_song.startswith("http") else f"ytsearch1:{nxt_song}"
-                    next_preview = f"PRE-FETCHING: {nxt_song[:26]}"
-                    next_prefetcher = BackgroundPrefetcher(nxt_query, f"track_{track_counter}")
-                    track_counter += 1
-                    next_prefetcher.start()
-
-                if cur_file:
-                    render_hacker_console(cur_title, "ZERO-GAP PLAYLIST", f"TRACK [{i+1:02d}/{total:02d}]", next_preview)
-                    print(f"{GREEN}[✓] Playing from temp cache. Auto-deletes immediately after play.{RESET}\n")
-                    ret = play_temp_file_and_purge(cur_file, cur_tag)
-                    if ret not in (0, 4):
-                        STOP_EVENT.set()
-                        kill_active_downloads()
-                        cleanup_temp_files()
-                        print(f"\n{RED}[!] SESSION TERMINATED. ALL TEMP SPACE FREED.{RESET}")
-                        break
-                else:
-                    cleanup_temp_files(cur_tag)
-                    print(f"{RED}[✗] Failed to load '{cur_title}'. Moving to next...{RESET}")
-                    time.sleep(0.8)
-
-                if next_prefetcher is not None:
-                    cur_tag = next_prefetcher.track_tag
-                    if not next_prefetcher.done_event.is_set():
-                        render_hacker_console(songs[i + 1], "ZERO-GAP PLAYLIST", f"TRACK [{i+2:02d}/{total:02d}]", "FINISHING CACHE...")
-                    cur_file, cur_title, _ = next_prefetcher.wait_and_get()
+            play_list_tracks(songs, "ZERO-GAP PLAYLIST", "Mirror Note/music.txt")
 
     except KeyboardInterrupt:
         STOP_EVENT.set()
@@ -460,4 +515,5 @@ def play_playlist():
         cleanup_temp_files()
 
 if __name__ == "__main__":
-    play_playlist()
+    is_history = "--history" in sys.argv
+    play_playlist(history_mode=is_history)
