@@ -2,10 +2,8 @@ import os
 import re
 import sys
 import json
-import glob
 import time
 import socket
-import shutil
 import curses
 import subprocess
 import threading
@@ -15,11 +13,10 @@ BASE_NOTES_DIR = "/storage/emulated/0/Mirror Note"
 MUSIC_TXT_PATH = os.path.join(BASE_NOTES_DIR, "music.txt")
 HISTORY_TXT_PATH = os.path.join(BASE_NOTES_DIR, "history.txt")
 TMP_BASE = os.environ.get("TMPDIR", "/data/data/com.termux/files/usr/tmp")
-TEMP_CACHE_DIR = os.path.join(TMP_BASE, "mirror_note_audio_cache")
-MPV_SOCKET = os.path.join(TMP_BASE, "mpv_touch_ipc.sock")
+MPV_SOCKET = os.path.join(TMP_BASE, "mpv_fast_ipc.sock")
 
 STOP_EVENT = threading.Event()
-ACTIVE_DOWNLOAD_PROCS = set()
+ACTIVE_PROCS = set()
 PROC_LOCK = threading.Lock()
 HISTORY_LOCK = threading.Lock()
 
@@ -95,52 +92,24 @@ def mark_played(title, video_id=None, seed_query=None):
                 SEEN_KEYS.add(" ".join(words[:2]))
 
 
-def add_session_track(url, title, vid_id=None):
-    if not url:
+def add_session_track(query_or_url, title, vid_id=None):
+    if not query_or_url:
         return
     for item in SESSION_TRACKS:
-        if item["url"] == url or (vid_id and item.get("id") == vid_id):
+        if item["query"] == query_or_url or (vid_id and item.get("id") == vid_id):
             return
-    SESSION_TRACKS.append({"url": url, "title": title or url, "id": vid_id})
+    SESSION_TRACKS.append({"query": query_or_url, "title": title or query_or_url, "id": vid_id})
 
 
-def ensure_temp_dir():
-    os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
-
-
-def kill_active_downloads():
+def kill_all_child_procs():
     with PROC_LOCK:
-        for p in list(ACTIVE_DOWNLOAD_PROCS):
+        for p in list(ACTIVE_PROCS):
             try:
-                p.terminate()
-                p.kill()
+                if p.poll() is None:
+                    p.kill()
             except Exception:
                 pass
-        ACTIVE_DOWNLOAD_PROCS.clear()
-
-
-def cleanup_temp_files(specific_prefix=None):
-    if not os.path.exists(TEMP_CACHE_DIR):
-        return
-    try:
-        if specific_prefix:
-            for p in glob.glob(os.path.join(TEMP_CACHE_DIR, f"{specific_prefix}*")):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-        else:
-            for entry in os.listdir(TEMP_CACHE_DIR):
-                full_path = os.path.join(TEMP_CACHE_DIR, entry)
-                try:
-                    if os.path.isfile(full_path) or os.path.islink(full_path):
-                        os.remove(full_path)
-                    elif os.path.isdir(full_path):
-                        shutil.rmtree(full_path, ignore_errors=True)
-                except OSError:
-                    pass
-    except Exception:
-        pass
+        ACTIVE_PROCS.clear()
 
 
 def send_mpv_cmd(command_list):
@@ -148,7 +117,7 @@ def send_mpv_cmd(command_list):
         return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(0.3)
+        s.settimeout(0.12)
         s.connect(MPV_SOCKET)
         payload = json.dumps({"command": command_list}) + "\n"
         s.sendall(payload.encode("utf-8"))
@@ -180,134 +149,123 @@ def format_sec(sec):
     return f"{m:02d}:{s:02d}"
 
 
-def fetch_track_meta(query):
-    try:
-        raw = subprocess.check_output(
-            ["yt-dlp", "--no-warnings", "--no-playlist", "-j", "-f", "bestaudio/best", query],
-            stderr=subprocess.DEVNULL,
-            timeout=20
-        ).decode("utf-8", errors="ignore").strip()
-        if not raw:
-            return query, query, None
-        data = json.loads(raw.splitlines()[0])
-        return data.get("webpage_url") or query, data.get("title") or query, data.get("id")
-    except Exception:
-        return query, query, None
-
-
-def download_temp_track(target_query, track_tag):
+def fast_get_stream_url(query):
+    """Fast direct audio URL lookup (-g) without heavy JSON overhead."""
     if STOP_EVENT.is_set():
         return None
-    ensure_temp_dir()
-    cleanup_temp_files(track_tag)
-    out_template = os.path.join(TEMP_CACHE_DIR, f"{track_tag}.%(ext)s")
-    cmd = [
-        "yt-dlp", "--no-warnings", "--no-playlist",
-        "-f", "bestaudio[ext=m4a]/bestaudio/best",
-        "-o", out_template, target_query
-    ]
     proc = None
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(
+            [
+                "yt-dlp", "--no-warnings", "--no-playlist",
+                "-f", "bestaudio[ext=m4a]/bestaudio/best",
+                "-g", query
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
         with PROC_LOCK:
-            ACTIVE_DOWNLOAD_PROCS.add(proc)
-        while proc.poll() is None:
-            if STOP_EVENT.is_set():
-                proc.terminate()
-                cleanup_temp_files(track_tag)
-                return None
-            time.sleep(0.2)
-        if proc.returncode != 0 or STOP_EVENT.is_set():
-            cleanup_temp_files(track_tag)
+            ACTIVE_PROCS.add(proc)
+        out, _ = proc.communicate(timeout=12)
+        if STOP_EVENT.is_set():
             return None
-        matches = glob.glob(os.path.join(TEMP_CACHE_DIR, f"{track_tag}.*"))
-        valid = [f for f in matches if not f.endswith(".part") and not f.endswith(".ytdl")]
-        return valid[0] if valid else None
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip().startswith("http")]
+        return lines[0] if lines else None
     except Exception:
-        cleanup_temp_files(track_tag)
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return None
     finally:
         if proc is not None:
             with PROC_LOCK:
-                ACTIVE_DOWNLOAD_PROCS.discard(proc)
+                ACTIVE_PROCS.discard(proc)
 
 
 def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
+    """Single fast flat search for non-repeating next songs."""
     clean_anchor = normalize_title(anchor_title)
     words = clean_anchor.split()
     artist_or_lead = " ".join(words[-2:]) if len(words) >= 2 else clean_anchor
-    queries = [
-        f"ytsearch{count}:{artist_or_lead} hits",
-        f"ytsearch{count}:{seed_query} playlist",
-    ]
+    search_q = f"ytsearch{count}:{artist_or_lead or seed_query} song"
+
     results = []
-    for q in queries:
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["yt-dlp", "--no-warnings", "--flat-playlist", "-j", search_q],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True
+        )
+        with PROC_LOCK:
+            ACTIVE_PROCS.add(proc)
+        out, _ = proc.communicate(timeout=12)
         if STOP_EVENT.is_set():
-            break
-        try:
-            raw = subprocess.check_output(
-                ["yt-dlp", "--no-warnings", "--flat-playlist", "-j", q],
-                stderr=subprocess.DEVNULL,
-                timeout=20
-            ).decode("utf-8", errors="ignore").strip()
-            for line in raw.splitlines():
-                if not line.strip():
-                    continue
+            return results
+
+        for line in (out or "").splitlines():
+            if not line.strip():
+                continue
+            try:
                 info = json.loads(line)
-                title = (info.get("title") or "").strip()
-                vid_id = (info.get("id") or "").strip()
-                url = info.get("url") or info.get("webpage_url")
-                if not title or not url:
-                    continue
-                if not url.startswith("http"):
-                    url = f"https://www.youtube.com/watch?v={url}"
-                if is_already_played(title, vid_id):
-                    continue
-                norm = normalize_title(title)
-                if not norm or any(normalize_title(t) == norm for _, t, _ in results):
-                    continue
-                results.append((url, title, vid_id))
-                if len(results) >= count:
-                    return results
-        except Exception:
-            continue
+            except Exception:
+                continue
+            title = (info.get("title") or "").strip()
+            vid_id = (info.get("id") or "").strip()
+            url = info.get("url") or info.get("webpage_url")
+            if not title or not url:
+                continue
+            if not url.startswith("http"):
+                url = f"https://www.youtube.com/watch?v={url}"
+            if is_already_played(title, vid_id):
+                continue
+            norm = normalize_title(title)
+            if not norm or any(normalize_title(t) == norm for _, t, _ in results):
+                continue
+            results.append((url, title, vid_id))
+            if len(results) >= count:
+                break
+    except Exception:
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    finally:
+        if proc is not None:
+            with PROC_LOCK:
+                ACTIVE_PROCS.discard(proc)
+
     return results
 
 
-class BackgroundPrefetcher:
-    def __init__(self, target_query, track_tag, known_title=None, known_id=None):
+class FastStreamPrefetcher:
+    """Resolves next track's direct audio stream URL in background for quick NEXT switching."""
+    def __init__(self, target_query, title):
         self.target_query = target_query
-        self.track_tag = track_tag
-        self.known_title = known_title
-        self.known_id = known_id
-        self.local_file = None
-        self.resolved_title = known_title or target_query
-        self.resolved_id = known_id
+        self.title = title
+        self.stream_url = None
         self.done_event = threading.Event()
-        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self.thread.start()
 
-    def _worker(self):
+    def _run(self):
         try:
-            if STOP_EVENT.is_set():
-                return
-            url, title, vid_id = fetch_track_meta(self.target_query)
-            if not self.known_title:
-                self.resolved_title = title
-            if vid_id:
-                self.resolved_id = vid_id
-            self.local_file = download_temp_track(url, self.track_tag)
+            if not STOP_EVENT.is_set():
+                self.stream_url = fast_get_stream_url(self.target_query)
         finally:
             self.done_event.set()
 
-    def wait_and_get(self):
-        while not self.done_event.is_set():
-            if STOP_EVENT.is_set():
-                return None, self.resolved_title, self.resolved_id
-            time.sleep(0.15)
-        return self.local_file, self.resolved_title, self.resolved_id
+    def get_ready_or_fallback(self):
+        # Sirf 0.4s max wait taaki NEXT dabane par delay na ho; na mile toh seedha query/url de
+        self.done_event.wait(timeout=0.4)
+        return self.stream_url or self.target_query
 
 
 def draw_round_pill(stdscr, row_y, left_x, width, label, color_pair):
@@ -323,7 +281,7 @@ def draw_round_pill(stdscr, row_y, left_x, width, label, color_pair):
     return (left_x, left_x + len(pill_text) - 1, max(0, row_y - 1), min(h - 1, row_y + 1))
 
 
-def play_with_ui(stdscr, media_source, track_tag, title, mode_label, queue_label, next_label, is_local_cache=False):
+def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_label):
     record_to_history(title)
     if os.path.exists(MPV_SOCKET):
         try:
@@ -331,22 +289,26 @@ def play_with_ui(stdscr, media_source, track_tag, title, mode_label, queue_label
         except OSError:
             pass
 
+    mpv_args = [
+        "mpv", "--no-video", "--really-quiet", "--cache=yes", "--demuxer-max-bytes=15M"
+    ]
+    # Agar direct http stream URL pehle se mil chuka hai toh ytdl دوبارہ nahi chalega (aur fast start hoga)
+    if playable_target.startswith("http") and "youtube.com/watch" not in playable_target and "youtu.be/" not in playable_target:
+        mpv_args.append("--ytdl=no")
+    else:
+        mpv_args.append("--ytdl-format=bestaudio[ext=m4a]/bestaudio/best")
+
+    mpv_args.extend([f"--input-ipc-server={MPV_SOCKET}", playable_target])
+
     mpv_proc = subprocess.Popen(
-        [
-            "mpv", "--no-video", "--really-quiet",
-            "--ytdl-format=bestaudio[ext=m4a]/bestaudio/best",
-            f"--input-ipc-server={MPV_SOCKET}",
-            media_source
-        ],
+        mpv_args,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
+    with PROC_LOCK:
+        ACTIVE_PROCS.add(mpv_proc)
 
-    for _ in range(20):
-        if os.path.exists(MPV_SOCKET) or mpv_proc.poll() is not None:
-            break
-        time.sleep(0.05)
-
+    result_action = "NEXT"
     try:
         while mpv_proc.poll() is None and not STOP_EVENT.is_set():
             stdscr.erase()
@@ -356,7 +318,7 @@ def play_with_ui(stdscr, media_source, track_tag, title, mode_label, queue_label
             pos = get_mpv_prop("time-pos", 0) or 0
             dur = get_mpv_prop("duration", 0) or 0
 
-            stdscr.addstr(0, 1, f"[CYBER-TOUCH PLAYER] :: {mode_label}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(0, 1, f"[CYBER-FAST PLAYER] :: {mode_label}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
             stdscr.addstr(1, 1, ("." * max(1, w - 2)), curses.color_pair(1))
             stdscr.addstr(3, 1, f"QUEUE   : {queue_label}"[:max(1, w - 2)], curses.color_pair(1))
             stdscr.addstr(4, 1, f"NEXT-UP : {next_label}"[:max(1, w - 2)], curses.color_pair(3))
@@ -422,12 +384,12 @@ def play_with_ui(stdscr, media_source, track_tag, title, mode_label, queue_label
                 action = "prv"
             elif key in (ord('q'), ord('Q'), ord('n'), ord('N')):
                 action = "nxt"
+            elif key in (3, 27, ord('x'), ord('X')):
+                action = "stp"
             elif key == curses.KEY_LEFT:
                 action = "rew"
             elif key == curses.KEY_RIGHT:
                 action = "fwd"
-            elif key in (3, 27, ord('x'), ord('X')):
-                action = "stp"
 
             if action == "tog":
                 send_mpv_cmd(["cycle", "pause"])
@@ -436,45 +398,37 @@ def play_with_ui(stdscr, media_source, track_tag, title, mode_label, queue_label
             elif action == "fwd":
                 send_mpv_cmd(["seek", 10, "relative"])
             elif action == "prv":
-                send_mpv_cmd(["quit"])
-                return "PREV"
+                result_action = "PREV"
+                break
             elif action == "nxt":
-                send_mpv_cmd(["quit"])
-                return "NEXT"
+                result_action = "NEXT"
+                break
             elif action == "stp":
                 STOP_EVENT.set()
-                send_mpv_cmd(["quit"])
-                return "STOP"
+                result_action = "STOP"
+                break
 
-        return "NEXT"
+        return result_action
     finally:
+        with PROC_LOCK:
+            ACTIVE_PROCS.discard(mpv_proc)
+        # Turant mpv band karein taaki NEXT mein der na ho
         if mpv_proc.poll() is None:
-            mpv_proc.terminate()
             try:
-                mpv_proc.wait(timeout=1)
-            except Exception:
                 mpv_proc.kill()
+            except Exception:
+                pass
         if os.path.exists(MPV_SOCKET):
             try:
                 os.remove(MPV_SOCKET)
             except OSError:
                 pass
-        if is_local_cache:
-            cleanup_temp_files(track_tag)
-
-
-def play_specific_session_track(stdscr, track_obj, track_counter, mode_title, queue_label, next_label):
-    tag = f"track_{track_counter}"
-    local_file = download_temp_track(track_obj["url"], tag)
-    if local_file:
-        return play_with_ui(stdscr, local_file, tag, track_obj["title"], mode_title, queue_label, next_label, is_local_cache=True)
-    return play_with_ui(stdscr, track_obj["url"], tag, track_obj["title"], mode_title, queue_label, next_label, is_local_cache=False)
 
 
 def curses_main(stdscr, history_mode=False):
     curses.curs_set(0)
     stdscr.nodelay(True)
-    stdscr.timeout(200)
+    stdscr.timeout(120)
     curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
 
     curses.start_color()
@@ -491,15 +445,6 @@ def curses_main(stdscr, history_mode=False):
     SESSION_TRACKS.clear()
 
     ensure_history_file()
-    ensure_temp_dir()
-    cleanup_temp_files()
-
-    def show_loading(msg):
-        stdscr.erase()
-        _, w = stdscr.getmaxyx()
-        stdscr.addstr(1, 1, "[CYBER-TOUCH PLAYER] INITIALIZING..."[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(3, 1, msg[:max(1, w - 2)], curses.color_pair(3))
-        stdscr.refresh()
 
     try:
         if history_mode:
@@ -517,54 +462,19 @@ def curses_main(stdscr, history_mode=False):
                 songs = [line.strip() for line in f if line.strip()]
             if not songs:
                 return
-            mode_title = "YT AUTO-NEXT RADIO" if len(songs) == 1 else "ZERO-GAP PLAYLIST"
+            mode_title = "YT AUTO-NEXT RADIO" if len(songs) == 1 else "FAST PLAYLIST"
 
-        track_counter = 1
-
-        # Single song -> Fast start stream + Auto-Next Radio + PREV support
+        # Single song -> Fast start + Auto-Next Radio + PREV support
         if not history_mode and len(songs) == 1:
             seed_song = songs[0]
-            show_loading(f"Starting fast stream: {seed_song}...")
-            query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
-            resolved_url, actual_title, actual_id = fetch_track_meta(query)
-            mark_played(actual_title, actual_id, seed_song)
-            add_session_track(resolved_url, actual_title, actual_id)
+            first_query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
+            mark_played(seed_song, None, seed_song)
+            add_session_track(first_query, seed_song)
 
-            stream_target = resolved_url or query
-            session_idx = 0
-            res = play_with_ui(
-                stdscr,
-                stream_target,
-                f"stream_{track_counter}",
-                actual_title,
-                mode_title,
-                "TRACK [01 / AUTO]",
-                "Preparing next...",
-                is_local_cache=False
-            )
-            track_counter += 1
-            if res == "STOP":
-                return
-
-            while res == "PREV" and not STOP_EVENT.is_set():
-                session_idx = max(0, session_idx - 1)
-                prev_obj = SESSION_TRACKS[session_idx]
-                res = play_specific_session_track(
-                    stdscr,
-                    prev_obj,
-                    track_counter,
-                    mode_title,
-                    f"PREV #{session_idx + 1:02d}",
-                    "Preparing next..."
-                )
-                track_counter += 1
-                if res == "STOP":
-                    return
-
-            next_queue = get_youtube_style_next_tracks(actual_title, seed_song, count=10)
+            next_queue = get_youtube_style_next_tracks(seed_song, seed_song, count=10)
             prefetcher = None
             next_status = "Searching..."
-            current_anchor = actual_title
+            current_anchor = seed_song
 
             if next_queue:
                 nxt_url, nxt_title, nxt_id = next_queue.pop(0)
@@ -572,9 +482,20 @@ def curses_main(stdscr, history_mode=False):
                 add_session_track(nxt_url, nxt_title, nxt_id)
                 current_anchor = nxt_title
                 next_status = nxt_title[:35]
-                prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title, known_id=nxt_id)
-                track_counter += 1
+                prefetcher = FastStreamPrefetcher(nxt_url, nxt_title)
                 prefetcher.start()
+
+            session_idx = 0
+            res = play_fast_ui(stdscr, first_query, seed_song, mode_title, "TRACK [01 / AUTO]", next_status)
+            if res == "STOP":
+                return
+
+            while res == "PREV" and not STOP_EVENT.is_set():
+                session_idx = max(0, session_idx - 1)
+                prev_obj = SESSION_TRACKS[session_idx]
+                res = play_fast_ui(stdscr, prev_obj["query"], prev_obj["title"], mode_title, f"PREV #{session_idx + 1:02d}", next_status)
+                if res == "STOP":
+                    return
 
             auto_num = 2
             while not STOP_EVENT.is_set():
@@ -583,26 +504,19 @@ def curses_main(stdscr, history_mode=False):
 
                 if prefetcher is None:
                     if not next_queue:
-                        time.sleep(1)
+                        time.sleep(0.3)
                         continue
                     cur_url, cur_title, cur_id = next_queue.pop(0)
                     mark_played(cur_title, cur_id)
                     add_session_track(cur_url, cur_title, cur_id)
-                    current_anchor = cur_title
-                    cur_tag = f"track_{track_counter}"
-                    track_counter += 1
-                    res = play_with_ui(stdscr, cur_url, cur_tag, cur_title, mode_title, f"AUTO-NEXT #{auto_num:02d}", next_status, is_local_cache=False)
+                    cur_target = cur_url
                 else:
-                    cur_tag = prefetcher.track_tag
-                    cur_file, cur_title, cur_id = prefetcher.wait_and_get()
-                    mark_played(cur_title, cur_id)
-                    current_anchor = cur_title
-                    if cur_file:
-                        res = play_with_ui(stdscr, cur_file, cur_tag, cur_title, mode_title, f"AUTO-NEXT #{auto_num:02d}", next_status, is_local_cache=True)
-                    else:
-                        fallback_url = prefetcher.target_query
-                        res = play_with_ui(stdscr, fallback_url, cur_tag, cur_title, mode_title, f"AUTO-NEXT #{auto_num:02d}", next_status, is_local_cache=False)
+                    cur_title = prefetcher.title
+                    cur_target = prefetcher.get_ready_or_fallback()
 
+                current_anchor = cur_title
+
+                # Agle gaane ka stream link turant background mein nikalna shuru karein
                 next_prefetcher = None
                 next_status = "Queueing..."
                 if next_queue:
@@ -610,19 +524,19 @@ def curses_main(stdscr, history_mode=False):
                     mark_played(nxt_title, nxt_id)
                     add_session_track(nxt_url, nxt_title, nxt_id)
                     next_status = nxt_title[:35]
-                    next_prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title, known_id=nxt_id)
-                    track_counter += 1
+                    next_prefetcher = FastStreamPrefetcher(nxt_url, nxt_title)
                     next_prefetcher.start()
 
+                res = play_fast_ui(stdscr, cur_target, cur_title, mode_title, f"AUTO-NEXT #{auto_num:02d}", next_status)
                 auto_num += 1
                 if res == "STOP":
                     return
+
                 session_idx = len(SESSION_TRACKS) - 1
                 while res == "PREV" and not STOP_EVENT.is_set():
                     session_idx = max(0, session_idx - 1)
                     prev_obj = SESSION_TRACKS[session_idx]
-                    res = play_specific_session_track(stdscr, prev_obj, track_counter, mode_title, f"PREV #{session_idx + 1:02d}", next_status)
-                    track_counter += 1
+                    res = play_fast_ui(stdscr, prev_obj["query"], prev_obj["title"], mode_title, f"PREV #{session_idx + 1:02d}", next_status)
                     if res == "STOP":
                         return
 
@@ -631,56 +545,45 @@ def curses_main(stdscr, history_mode=False):
         # Multiple songs or History list -> Fast start + Pre-fetch + PREV support
         else:
             total = len(songs)
-            resolved_list = []
-            for s in songs:
-                resolved_list.append({
-                    "url": s if s.startswith("http") else f"ytsearch1:{s}",
-                    "title": s,
-                    "id": None
-                })
+            items = [
+                {"query": s if s.startswith("http") else f"ytsearch1:{s}", "title": s}
+                for s in songs
+            ]
 
             idx = 0
+            prefetcher = None
+            if total > 1:
+                prefetcher = FastStreamPrefetcher(items[1]["query"], items[1]["title"])
+                prefetcher.start()
+
             while 0 <= idx < total and not STOP_EVENT.is_set():
-                cur_item = resolved_list[idx]
+                cur_item = items[idx]
+                if prefetcher is not None and prefetcher.title == cur_item["title"]:
+                    cur_target = prefetcher.get_ready_or_fallback()
+                else:
+                    cur_target = cur_item["query"]
+
+                next_preview = items[idx + 1]["title"][:35] if idx + 1 < total else "End of Queue"
                 next_prefetcher = None
-                next_preview = "End of Queue"
                 if idx + 1 < total:
-                    nxt_item = resolved_list[idx + 1]
-                    next_preview = nxt_item["title"][:35]
-                    next_prefetcher = BackgroundPrefetcher(nxt_item["url"], f"track_{track_counter}", known_title=nxt_item["title"])
-                    track_counter += 1
+                    nxt_item = items[idx + 1]
+                    next_prefetcher = FastStreamPrefetcher(nxt_item["query"], nxt_item["title"])
                     next_prefetcher.start()
 
-                res = play_with_ui(
-                    stdscr,
-                    cur_item["url"],
-                    f"track_{track_counter}",
-                    cur_item["title"],
-                    mode_title,
-                    f"TRACK [{idx+1:02d}/{total:02d}]",
-                    next_preview,
-                    is_local_cache=False
-                )
-                track_counter += 1
-
+                res = play_fast_ui(stdscr, cur_target, cur_item["title"], mode_title, f"TRACK [{idx+1:02d}/{total:02d}]", next_preview)
                 if res == "STOP":
                     return
                 if res == "PREV":
-                    if next_prefetcher is not None:
-                        cleanup_temp_files(next_prefetcher.track_tag)
                     idx = max(0, idx - 1)
+                    prefetcher = None
                     continue
 
                 idx += 1
-                if next_prefetcher is not None and idx < total:
-                    nxt_file, nxt_title, _ = next_prefetcher.wait_and_get()
-                    if nxt_file:
-                        resolved_list[idx]["title"] = nxt_title
+                prefetcher = next_prefetcher
 
     finally:
         STOP_EVENT.set()
-        kill_active_downloads()
-        cleanup_temp_files()
+        kill_all_child_procs()
 
 
 if __name__ == "__main__":
@@ -690,5 +593,4 @@ if __name__ == "__main__":
         curses.wrapper(curses_main, is_history)
     except KeyboardInterrupt:
         STOP_EVENT.set()
-        kill_active_downloads()
-        cleanup_temp_files()
+        kill_all_child_procs()
