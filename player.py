@@ -26,6 +26,7 @@ HISTORY_LOCK = threading.Lock()
 SEEN_IDS = set()
 SEEN_TITLES = set()
 SEEN_KEYS = set()
+SESSION_TRACKS = []  # List of dicts: {"url": ..., "title": ..., "id": ...}
 
 
 def ensure_history_file():
@@ -90,6 +91,15 @@ def mark_played(title, video_id=None, seed_query=None):
                 SEEN_KEYS.add(" ".join(words[:2]))
 
 
+def add_session_track(url, title, vid_id=None):
+    if not url:
+        return
+    for item in SESSION_TRACKS:
+        if item["url"] == url or (vid_id and item.get("id") == vid_id):
+            return
+    SESSION_TRACKS.append({"url": url, "title": title or url, "id": vid_id})
+
+
 def ensure_temp_dir():
     os.makedirs(TEMP_CACHE_DIR, exist_ok=True)
 
@@ -130,7 +140,6 @@ def cleanup_temp_files(specific_prefix=None):
 
 
 def send_mpv_cmd(command_list):
-    """Sends JSON IPC command to running mpv instance."""
     if not os.path.exists(MPV_SOCKET):
         return None
     try:
@@ -298,8 +307,24 @@ class BackgroundPrefetcher:
         return self.local_file, self.resolved_title, self.resolved_id
 
 
+def draw_button_box(stdscr, top_y, left_x, width, label, color_pair):
+    """Draws a crisp, readable 3-line touch button block."""
+    h, w = stdscr.getmaxyx()
+    if top_y + 2 >= h or left_x + width >= w or left_x < 0:
+        return None
+    inner = max(1, width - 2)
+    centered = label.center(inner)[:inner]
+    try:
+        stdscr.addstr(top_y, left_x, "+" + "-" * inner + "+", color_pair)
+        stdscr.addstr(top_y + 1, left_x, "|" + centered + "|", color_pair | curses.A_BOLD)
+        stdscr.addstr(top_y + 2, left_x, "+" + "-" * inner + "+", color_pair)
+    except curses.error:
+        pass
+    return (left_x, left_x + width - 1, top_y, top_y + 2)
+
+
 def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, queue_label, next_label):
-    """Plays cached audio in mpv with a bottom touch-clickable terminal control bar."""
+    """Plays cached audio in mpv with clear, large touch buttons including PREV."""
     record_to_history(title)
     if os.path.exists(MPV_SOCKET):
         try:
@@ -317,7 +342,6 @@ def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, q
         stderr=subprocess.DEVNULL
     )
 
-    # Socket ready hone ka halka wait
     for _ in range(20):
         if os.path.exists(MPV_SOCKET) or mpv_proc.poll() is not None:
             break
@@ -332,46 +356,55 @@ def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, q
             pos = get_mpv_prop("time-pos", 0) or 0
             dur = get_mpv_prop("duration", 0) or 0
 
-            # Top Hacker Header
-            stdscr.addstr(0, 0, f"[CYBER-TOUCH PLAYER] :: {mode_label}"[:w-1], curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(1, 0, ("=" * (w - 1)), curses.color_pair(2))
-            stdscr.addstr(3, 0, f"QUEUE   : {queue_label}"[:w-1], curses.color_pair(3))
-            stdscr.addstr(4, 0, f"NEXT-UP : {next_label}"[:w-1], curses.color_pair(4))
-            stdscr.addstr(6, 0, f"NOW PLAYING ({'PAUSED' if paused else 'ACTIVE'}):"[:w-1], curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(7, 0, f"> {title}"[:w-1], curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(0, 1, f"[CYBER-TOUCH PLAYER] :: {mode_label}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(1, 1, ("-" * max(1, w - 2)), curses.color_pair(2))
+            stdscr.addstr(3, 1, f"QUEUE   : {queue_label}"[:max(1, w - 2)], curses.color_pair(3))
+            stdscr.addstr(4, 1, f"NEXT-UP : {next_label}"[:max(1, w - 2)], curses.color_pair(4))
+            stdscr.addstr(6, 1, f"NOW PLAYING ({'PAUSED' if paused else 'PLAYING'}):"[:max(1, w - 2)], curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addstr(7, 1, f"> {title}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
 
-            # Live Progress Bar
-            bar_y = max(9, h - 6)
-            bar_w = max(10, w - 18)
+            # Progress Bar
+            bar_y = max(9, min(h - 10, 10))
+            bar_w = max(8, w - 18)
             ratio = min(1.0, max(0.0, (pos / dur))) if dur > 0 else 0
             filled = int(bar_w * ratio)
-            bar_str = "█" * filled + "░" * (bar_w - filled)
-            stdscr.addstr(bar_y, 0, f"{format_sec(pos)} [{bar_str}] {format_sec(dur)}"[:w-1], curses.color_pair(1))
+            bar_str = "#" * filled + "-" * (bar_w - filled)
+            stdscr.addstr(bar_y, 1, f"{format_sec(pos)} [{bar_str}] {format_sec(dur)}"[:max(1, w - 2)], curses.color_pair(1))
 
-            # Bottom Touch Control Bar (Screen ke bilkul neeche)
-            btn_y = h - 3
-            stdscr.addstr(btn_y - 1, 0, ("─" * (w - 1)), curses.color_pair(2))
-
-            play_lbl = " ▶ PLAY " if paused else " ⏸ PAUSE "
-            buttons = [
-                ("rew", " ⏪ -10s "),
-                ("tog", play_lbl),
-                ("nxt", " ⏭ NEXT "),
-                ("fwd", " +10s ⏩ "),
-                ("stp", " ⏹ STOP "),
-            ]
+            # Clear 2-Row Touch Control Panel near Bottom
+            row1_y = max(bar_y + 2, h - 8)
+            row2_y = row1_y + 3
+            play_lbl = "PLAY" if paused else "PAUSE"
 
             btn_regions = []
-            cur_x = 1
-            for action_id, label in buttons:
-                if cur_x + len(label) + 1 >= w:
-                    break
-                color = curses.color_pair(5) if action_id == "stp" else curses.color_pair(6)
-                stdscr.addstr(btn_y, cur_x, label, color | curses.A_BOLD)
-                btn_regions.append((cur_x, cur_x + len(label) - 1, action_id))
-                cur_x += len(label) + 2
+            avail_w = max(24, w - 2)
 
-            stdscr.addstr(h - 1, 0, "Tap buttons above or bottom bar | 'q'=Next 'Space'=Pause"[:w-1], curses.color_pair(3))
+            # Row 1: PREV | PAUSE/PLAY | NEXT
+            r1_defs = [("prv", "PREV"), ("tog", play_lbl), ("nxt", "NEXT")]
+            gap = 1
+            bw1 = max(7, (avail_w - gap * (len(r1_defs) - 1)) // len(r1_defs))
+            cx = 1
+            for act, lbl in r1_defs:
+                box = draw_button_box(stdscr, row1_y, cx, bw1, lbl, curses.color_pair(7))
+                if box:
+                    btn_regions.append((box, act))
+                cx += bw1 + gap
+
+            # Row 2: -10s | +10s | STOP
+            r2_defs = [("rew", "-10s"), ("fwd", "+10s"), ("stp", "STOP")]
+            bw2 = max(7, (avail_w - gap * (len(r2_defs) - 1)) // len(r2_defs))
+            cx = 1
+            for act, lbl in r2_defs:
+                cp = curses.color_pair(5) if act == "stp" else curses.color_pair(7)
+                box = draw_button_box(stdscr, row2_y, cx, bw2, lbl, cp)
+                if box:
+                    btn_regions.append((box, act))
+                cx += bw2 + gap
+
+            hint_y = min(h - 1, row2_y + 3)
+            if hint_y < h:
+                stdscr.addstr(hint_y, 1, "Tap buttons or keys: [b]=Prev [Space]=Pause [q]=Next [x]=Stop"[:max(1, w - 2)], curses.color_pair(3))
+
             stdscr.refresh()
 
             key = stdscr.getch()
@@ -380,23 +413,23 @@ def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, q
             if key == curses.KEY_MOUSE:
                 try:
                     _, mx, my, _, _ = curses.getmouse()
-                    # Bottom 3 rows par touch hone par matching button trigger karein
-                    if btn_y - 1 <= my <= btn_y + 1:
-                        for x1, x2, act in btn_regions:
-                            if x1 <= mx <= x2:
-                                action = act
-                                break
+                    for (x1, x2, y1, y2), act in btn_regions:
+                        if x1 <= mx <= x2 and y1 <= my <= y2:
+                            action = act
+                            break
                 except Exception:
                     pass
             elif key in (ord(' '), ord('p'), ord('P')):
                 action = "tog"
+            elif key in (ord('b'), ord('B')):
+                action = "prv"
             elif key in (ord('q'), ord('Q'), ord('n'), ord('N')):
                 action = "nxt"
             elif key == curses.KEY_LEFT:
                 action = "rew"
             elif key == curses.KEY_RIGHT:
                 action = "fwd"
-            elif key in (3, 27, ord('x'), ord('X')):  # Ctrl+C, Esc, X
+            elif key in (3, 27, ord('x'), ord('X')):
                 action = "stp"
 
             if action == "tog":
@@ -405,6 +438,9 @@ def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, q
                 send_mpv_cmd(["seek", -10, "relative"])
             elif action == "fwd":
                 send_mpv_cmd(["seek", 10, "relative"])
+            elif action == "prv":
+                send_mpv_cmd(["quit"])
+                return "PREV"
             elif action == "nxt":
                 send_mpv_cmd(["quit"])
                 return "NEXT"
@@ -429,6 +465,15 @@ def play_with_touch_ui(stdscr, local_audio_path, track_tag, title, mode_label, q
         cleanup_temp_files(track_tag)
 
 
+def play_specific_session_track(stdscr, track_obj, track_counter, mode_title, queue_label, next_label):
+    tag = f"track_{track_counter}"
+    local_file = download_temp_track(track_obj["url"], tag)
+    if not local_file:
+        cleanup_temp_files(tag)
+        return "NEXT"
+    return play_with_touch_ui(stdscr, local_file, tag, track_obj["title"], mode_title, queue_label, next_label)
+
+
 def curses_main(stdscr, history_mode=False):
     curses.curs_set(0)
     stdscr.nodelay(True)
@@ -442,12 +487,13 @@ def curses_main(stdscr, history_mode=False):
     curses.init_pair(3, curses.COLOR_CYAN, -1)
     curses.init_pair(4, curses.COLOR_YELLOW, -1)
     curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_RED)
-    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_GREEN)
+    curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_GREEN)
 
     STOP_EVENT.clear()
     SEEN_IDS.clear()
     SEEN_TITLES.clear()
     SEEN_KEYS.clear()
+    SESSION_TRACKS.clear()
 
     ensure_history_file()
     ensure_temp_dir()
@@ -455,8 +501,9 @@ def curses_main(stdscr, history_mode=False):
 
     def show_loading(msg):
         stdscr.erase()
-        stdscr.addstr(1, 0, "[CYBER-TOUCH PLAYER] INITIALIZING...", curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(3, 0, msg, curses.color_pair(3))
+        _, w = stdscr.getmaxyx()
+        stdscr.addstr(1, 1, "[CYBER-TOUCH PLAYER] INITIALIZING..."[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(3, 1, msg[:max(1, w - 2)], curses.color_pair(3))
         stdscr.refresh()
 
     try:
@@ -479,13 +526,14 @@ def curses_main(stdscr, history_mode=False):
 
         track_counter = 1
 
-        # Single song -> YouTube Auto-Next Radio
+        # Single song -> YouTube Auto-Next Radio with PREV support
         if not history_mode and len(songs) == 1:
             seed_song = songs[0]
             show_loading(f"Loading seed track: {seed_song}...")
             query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
             resolved_url, actual_title, actual_id = fetch_track_meta(query)
             mark_played(actual_title, actual_id, seed_song)
+            add_session_track(resolved_url, actual_title, actual_id)
 
             seed_tag = f"track_{track_counter}"
             track_counter += 1
@@ -499,16 +547,25 @@ def curses_main(stdscr, history_mode=False):
             if next_queue:
                 nxt_url, nxt_title, nxt_id = next_queue.pop(0)
                 mark_played(nxt_title, nxt_id)
+                add_session_track(nxt_url, nxt_title, nxt_id)
                 current_anchor = nxt_title
                 next_status = nxt_title[:35]
                 prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title, known_id=nxt_id)
                 track_counter += 1
                 prefetcher.start()
 
+            session_idx = 0
             if seed_file:
                 res = play_with_touch_ui(stdscr, seed_file, seed_tag, actual_title, mode_title, "TRACK [01 / AUTO]", next_status)
                 if res == "STOP":
                     return
+                while res == "PREV" and not STOP_EVENT.is_set():
+                    session_idx = max(0, session_idx - 1)
+                    prev_obj = SESSION_TRACKS[session_idx]
+                    res = play_specific_session_track(stdscr, prev_obj, track_counter, mode_title, f"PREV #{session_idx + 1:02d}", next_status)
+                    track_counter += 1
+                    if res == "STOP":
+                        return
 
             auto_num = 2
             while not STOP_EVENT.is_set():
@@ -521,6 +578,7 @@ def curses_main(stdscr, history_mode=False):
                         continue
                     cur_url, cur_title, cur_id = next_queue.pop(0)
                     mark_played(cur_title, cur_id)
+                    add_session_track(cur_url, cur_title, cur_id)
                     current_anchor = cur_title
                     cur_tag = f"track_{track_counter}"
                     track_counter += 1
@@ -539,58 +597,87 @@ def curses_main(stdscr, history_mode=False):
                 if next_queue:
                     nxt_url, nxt_title, nxt_id = next_queue.pop(0)
                     mark_played(nxt_title, nxt_id)
+                    add_session_track(nxt_url, nxt_title, nxt_id)
                     next_preview = nxt_title[:35]
                     next_prefetcher = BackgroundPrefetcher(nxt_url, f"track_{track_counter}", known_title=nxt_title, known_id=nxt_id)
                     track_counter += 1
                     next_prefetcher.start()
 
                 if cur_file:
+                    session_idx = len(SESSION_TRACKS) - 1
                     res = play_with_touch_ui(stdscr, cur_file, cur_tag, cur_title, mode_title, f"AUTO-NEXT #{auto_num:02d}", next_preview)
                     auto_num += 1
                     if res == "STOP":
                         return
+                    while res == "PREV" and not STOP_EVENT.is_set():
+                        session_idx = max(0, session_idx - 1)
+                        prev_obj = SESSION_TRACKS[session_idx]
+                        res = play_specific_session_track(stdscr, prev_obj, track_counter, mode_title, f"PREV #{session_idx + 1:02d}", next_preview)
+                        track_counter += 1
+                        if res == "STOP":
+                            return
                 else:
                     cleanup_temp_files(cur_tag)
 
                 prefetcher = next_prefetcher
 
-        # Multiple songs or History list
+        # Playlist or History with PREV support
         else:
             total = len(songs)
-            first_query = songs[0] if songs[0].startswith("http") else f"ytsearch1:{songs[0]}"
-            show_loading(f"Loading track 1/{total}: {songs[0]}...")
-            first_url, first_title, _ = fetch_track_meta(first_query)
+            resolved_list = []
+            for s in songs:
+                u, t, vid = fetch_track_meta(s if s.startswith("http") else f"ytsearch1:{s}")
+                resolved_list.append({"url": u, "title": t, "id": vid})
+
+            idx = 0
             first_tag = f"track_{track_counter}"
             track_counter += 1
-            cur_file = download_temp_track(first_url, first_tag)
-            cur_title = first_title
+            show_loading(f"Loading track 1/{total}: {resolved_list[0]['title']}...")
+            cur_file = download_temp_track(resolved_list[0]["url"], first_tag)
             cur_tag = first_tag
 
-            for i in range(total):
-                if STOP_EVENT.is_set():
-                    break
+            while 0 <= idx < total and not STOP_EVENT.is_set():
                 next_prefetcher = None
                 next_preview = "End of Queue"
-                if i + 1 < total:
-                    nxt_song = songs[i + 1]
-                    nxt_query = nxt_song if nxt_song.startswith("http") else f"ytsearch1:{nxt_song}"
-                    next_preview = nxt_song[:35]
-                    next_prefetcher = BackgroundPrefetcher(nxt_query, f"track_{track_counter}")
+                if idx + 1 < total:
+                    nxt_item = resolved_list[idx + 1]
+                    next_preview = nxt_item["title"][:35]
+                    next_prefetcher = BackgroundPrefetcher(nxt_item["url"], f"track_{track_counter}", known_title=nxt_item["title"], known_id=nxt_item["id"])
                     track_counter += 1
                     next_prefetcher.start()
 
                 if cur_file:
-                    res = play_with_touch_ui(stdscr, cur_file, cur_tag, cur_title, mode_title, f"TRACK [{i+1:02d}/{total:02d}]", next_preview)
+                    res = play_with_touch_ui(stdscr, cur_file, cur_tag, resolved_list[idx]["title"], mode_title, f"TRACK [{idx+1:02d}/{total:02d}]", next_preview)
                     if res == "STOP":
                         return
+                    if res == "PREV":
+                        if next_prefetcher is not None:
+                            cleanup_temp_files(next_prefetcher.track_tag)
+                        idx = max(0, idx - 1)
+                        prev_tag = f"track_{track_counter}"
+                        track_counter += 1
+                        show_loading(f"Loading previous track: {resolved_list[idx]['title']}...")
+                        cur_file = download_temp_track(resolved_list[idx]["url"], prev_tag)
+                        cur_tag = prev_tag
+                        continue
                 else:
                     cleanup_temp_files(cur_tag)
+
+                idx += 1
+                if idx >= total:
+                    break
 
                 if next_prefetcher is not None:
                     cur_tag = next_prefetcher.track_tag
                     if not next_prefetcher.done_event.is_set():
-                        show_loading(f"Finishing cache: {songs[i+1]}...")
-                    cur_file, cur_title, _ = next_prefetcher.wait_and_get()
+                        show_loading(f"Finishing cache: {resolved_list[idx]['title']}...")
+                    cur_file, _, _ = next_prefetcher.wait_and_get()
+                else:
+                    new_tag = f"track_{track_counter}"
+                    track_counter += 1
+                    show_loading(f"Loading track {idx+1}/{total}: {resolved_list[idx]['title']}...")
+                    cur_file = download_temp_track(resolved_list[idx]["url"], new_tag)
+                    cur_tag = new_tag
 
     finally:
         STOP_EVENT.set()
