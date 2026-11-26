@@ -12,48 +12,17 @@ from updater import check_and_update
 
 BASE_NOTES_DIR = "/storage/emulated/0/Mirror Note"
 MUSIC_TXT_PATH = os.path.join(BASE_NOTES_DIR, "music.txt")
-HISTORY_TXT_PATH = os.path.join(BASE_NOTES_DIR, "history.txt")
 TMP_BASE = os.environ.get("TMPDIR", "/data/data/com.termux/files/usr/tmp")
 MPV_SOCKET = os.path.join(TMP_BASE, "mpv_fast_ipc.sock")
 
 STOP_EVENT = threading.Event()
 ACTIVE_PROCS = set()
 PROC_LOCK = threading.Lock()
-HISTORY_LOCK = threading.Lock()
 
 SEEN_IDS = set()
 SEEN_TITLES = set()
 SEEN_KEYS = set()
 SESSION_TRACKS = []
-
-
-def ensure_history_file():
-    try:
-        os.makedirs(BASE_NOTES_DIR, exist_ok=True)
-        if not os.path.exists(HISTORY_TXT_PATH):
-            with open(HISTORY_TXT_PATH, "w", encoding="utf-8") as f:
-                f.write("")
-    except Exception:
-        pass
-
-
-def record_to_history(song_title):
-    clean_entry = (song_title or "").strip()
-    if not clean_entry:
-        return
-    with HISTORY_LOCK:
-        try:
-            ensure_history_file()
-            existing = []
-            if os.path.exists(HISTORY_TXT_PATH):
-                with open(HISTORY_TXT_PATH, "r", encoding="utf-8") as f:
-                    existing = [line.strip() for line in f if line.strip()]
-            filtered = [line for line in existing if line.lower() != clean_entry.lower()]
-            updated = [clean_entry] + filtered[:499]
-            with open(HISTORY_TXT_PATH, "w", encoding="utf-8") as f:
-                f.write("\n".join(updated) + "\n")
-        except Exception:
-            pass
 
 
 def normalize_title(title):
@@ -285,7 +254,6 @@ def start_mpv_for_target(playable_target):
         except OSError:
             pass
 
-    # Agar direct stream URL nahi mila ya ytsearch query hai, toh mpv ytdl ko allow rakhein
     is_raw_stream = (
         playable_target.startswith("http")
         and "youtube.com/watch" not in playable_target
@@ -307,7 +275,6 @@ def start_mpv_for_target(playable_target):
 
 
 def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_label):
-    record_to_history(title)
     mpv_proc = start_mpv_for_target(playable_target)
     with PROC_LOCK:
         ACTIVE_PROCS.add(mpv_proc)
@@ -428,7 +395,7 @@ def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_l
                 pass
 
 
-def curses_main(stdscr, history_mode=False):
+def curses_main(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
     stdscr.timeout(120)
@@ -447,8 +414,6 @@ def curses_main(stdscr, history_mode=False):
     SEEN_KEYS.clear()
     SESSION_TRACKS.clear()
 
-    ensure_history_file()
-
     def show_status(msg):
         stdscr.erase()
         _, w = stdscr.getmaxyx()
@@ -457,36 +422,22 @@ def curses_main(stdscr, history_mode=False):
         stdscr.refresh()
 
     try:
-        if history_mode:
-            if not os.path.exists(HISTORY_TXT_PATH):
-                show_status("history.txt nahi mila. Press any key...")
-                stdscr.nodelay(False)
-                stdscr.getch()
-                return
-            with open(HISTORY_TXT_PATH, "r", encoding="utf-8") as f:
-                songs = [line.strip() for line in f if line.strip()]
-            if not songs:
-                show_status("history.txt khali hai. Press any key...")
-                stdscr.nodelay(False)
-                stdscr.getch()
-                return
-            mode_title = "HISTORY PLAYBACK"
-        else:
-            if not os.path.exists(MUSIC_TXT_PATH):
-                show_status("music.txt nahi mila. Press any key...")
-                stdscr.nodelay(False)
-                stdscr.getch()
-                return
-            with open(MUSIC_TXT_PATH, "r", encoding="utf-8") as f:
-                songs = [line.strip() for line in f if line.strip()]
-            if not songs:
-                show_status("music.txt khali hai. Press any key...")
-                stdscr.nodelay(False)
-                stdscr.getch()
-                return
-            mode_title = "YT AUTO-NEXT RADIO" if len(songs) == 1 else "FAST PLAYLIST"
+        if not os.path.exists(MUSIC_TXT_PATH):
+            show_status("music.txt nahi mila. Press any key...")
+            stdscr.nodelay(False)
+            stdscr.getch()
+            return
+        with open(MUSIC_TXT_PATH, "r", encoding="utf-8") as f:
+            songs = [line.strip() for line in f if line.strip()]
+        if not songs:
+            show_status("music.txt khali hai. Press any key...")
+            stdscr.nodelay(False)
+            stdscr.getch()
+            return
 
-        if not history_mode and len(songs) == 1:
+        mode_title = "YT AUTO-NEXT RADIO" if len(songs) == 1 else "FAST PLAYLIST"
+
+        if len(songs) == 1:
             seed_song = songs[0]
             first_query = seed_song if seed_song.startswith("http") else f"ytsearch1:{seed_song}"
             mark_played(seed_song, None, seed_song)
@@ -618,9 +569,8 @@ def curses_main(stdscr, history_mode=False):
 
 if __name__ == "__main__":
     check_and_update(force=False, silent=True)
-    is_history = "--history" in sys.argv
     try:
-        curses.wrapper(curses_main, is_history)
+        curses.wrapper(curses_main)
     except KeyboardInterrupt:
         STOP_EVENT.set()
         kill_all_child_procs()
