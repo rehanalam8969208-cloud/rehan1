@@ -5,18 +5,14 @@ import time
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(REPO_DIR, ".last_update_check")
-CHECK_INTERVAL = 300  # Har 5 minute mein background check
+CHECK_INTERVAL = 300
+
 
 def refresh_aliases():
     bashrc_path = os.path.expanduser("~/.bashrc")
     aliases = [
-        f'alias ymp4="python \'{REPO_DIR}/downloader.py\' youtube mp4"',
-        f'alias ymp3="python \'{REPO_DIR}/downloader.py\' youtube mp3"',
-        f'alias imp4="python \'{REPO_DIR}/downloader.py\' insta mp4"',
-        f'alias imp3="python \'{REPO_DIR}/downloader.py\' insta mp3"',
+        f'alias dw="python \'{REPO_DIR}/dw.py\'"',
         f'alias play="python \'{REPO_DIR}/player.py\'"',
-        f'alias H="python \'{REPO_DIR}/player.py\' --history"',
-        f'alias h="python \'{REPO_DIR}/player.py\' --history"',
         f'alias sync="python \'{REPO_DIR}/updater.py\' --force"'
     ]
     try:
@@ -25,7 +21,7 @@ def refresh_aliases():
             with open(bashrc_path, "r", encoding="utf-8") as f:
                 skip_keys = (
                     "alias ymp4=", "alias ymp3=", "alias imp4=", "alias imp3=",
-                    "alias play=", "alias sync=", "alias h=", "alias H=", "alias upload="
+                    "alias play=", "alias sync=", "alias dw=", "alias h=", "alias H=", "alias upload="
                 )
                 lines = [line for line in f if not any(k in line for k in skip_keys)]
         with open(bashrc_path, "w", encoding="utf-8") as f:
@@ -34,6 +30,7 @@ def refresh_aliases():
                 f.write(a + "\n")
     except Exception:
         pass
+
 
 def should_check():
     if not os.path.exists(CACHE_FILE):
@@ -44,6 +41,7 @@ def should_check():
     except Exception:
         return True
 
+
 def mark_checked():
     try:
         with open(CACHE_FILE, "w") as f:
@@ -51,11 +49,12 @@ def mark_checked():
     except Exception:
         pass
 
+
 def check_and_update(force=False, silent=True):
     git_dir = os.path.join(REPO_DIR, ".git")
     if not os.path.exists(git_dir):
         if not silent:
-            print("\033[38;5;226m[!] Git repository (.git) nahi mila. Auto-update ke liye repo ko git clone karein.\033[0m")
+            print("\033[38;5;226m[!] Git repository (.git) nahi mila.\033[0m")
         return False
 
     if not force and not should_check():
@@ -83,8 +82,9 @@ def check_and_update(force=False, silent=True):
             return False
     except Exception:
         if not silent:
-            print("\033[38;5;226m[!] Update check skip hua (network ya git remote check karein).\033[0m")
+            print("\033[38;5;226m[!] Update check skip hua.\033[0m")
         return False
+
 
 if __name__ == "__main__":
     is_force = "--force" in sys.argv
