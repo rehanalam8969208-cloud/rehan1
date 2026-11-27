@@ -26,7 +26,6 @@ SESSION_TRACKS = []
 
 
 def auto_sync_and_restart_if_needed():
-    """Checks GitHub on every 'play' start; pulls updates and restarts player.py cleanly."""
     if os.environ.get("REHAN_PLAYER_UPDATED") == "1":
         return
     updated = check_and_update(force=True, silent=True)
@@ -166,58 +165,64 @@ def fast_get_stream_url(query):
 
 
 def get_youtube_style_next_tracks(anchor_title, seed_query, count=10):
-    clean_anchor = normalize_title(anchor_title)
-    words = clean_anchor.split()
-    artist_or_lead = " ".join(words[-2:]) if len(words) >= 2 else clean_anchor
-    search_q = f"ytsearch{count}:{artist_or_lead or seed_query} song"
+    """Finds related songs closely tied to the user's seed_query without repeating played ones."""
+    clean_seed = re.sub(r'[^a-zA-Z0-9\s]', ' ', (seed_query or '')).strip()
+    base_term = clean_seed if clean_seed else normalize_title(anchor_title)
+    search_queries = [
+        f"ytsearch{count}:{base_term} song",
+        f"ytsearch{count}:{base_term} audio",
+    ]
 
     results = []
-    proc = None
-    try:
-        proc = subprocess.Popen(
-            ["yt-dlp", "--no-warnings", "--flat-playlist", "-j", search_q],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True
-        )
-        with PROC_LOCK:
-            ACTIVE_PROCS.add(proc)
-        out, _ = proc.communicate(timeout=15)
+    for search_q in search_queries:
         if STOP_EVENT.is_set():
-            return results
-
-        for line in (out or "").splitlines():
-            if not line.strip():
-                continue
-            try:
-                info = json.loads(line)
-            except Exception:
-                continue
-            title = (info.get("title") or "").strip()
-            vid_id = (info.get("id") or "").strip()
-            url = info.get("url") or info.get("webpage_url")
-            if not title or not url:
-                continue
-            if not url.startswith("http"):
-                url = f"https://www.youtube.com/watch?v={url}"
-            if is_already_played(title, vid_id):
-                continue
-            norm = normalize_title(title)
-            if not norm or any(normalize_title(t) == norm for _, t, _ in results):
-                continue
-            results.append((url, title, vid_id))
-            if len(results) >= count:
-                break
-    except Exception:
-        if proc and proc.poll() is None:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    finally:
-        if proc is not None:
+            break
+        proc = None
+        try:
+            proc = subprocess.Popen(
+                ["yt-dlp", "--no-warnings", "--flat-playlist", "-j", search_q],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
             with PROC_LOCK:
-                ACTIVE_PROCS.discard(proc)
+                ACTIVE_PROCS.add(proc)
+            out, _ = proc.communicate(timeout=15)
+            if STOP_EVENT.is_set():
+                return results
+
+            for line in (out or "").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    info = json.loads(line)
+                except Exception:
+                    continue
+                title = (info.get("title") or "").strip()
+                vid_id = (info.get("id") or "").strip()
+                url = info.get("url") or info.get("webpage_url")
+                if not title or not url:
+                    continue
+                if not url.startswith("http"):
+                    url = f"https://www.youtube.com/watch?v={url}"
+                if is_already_played(title, vid_id):
+                    continue
+                norm = normalize_title(title)
+                if not norm or any(normalize_title(t) == norm for _, t, _ in results):
+                    continue
+                results.append((url, title, vid_id))
+                if len(results) >= count:
+                    return results
+        except Exception:
+            if proc and proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        finally:
+            if proc is not None:
+                with PROC_LOCK:
+                    ACTIVE_PROCS.discard(proc)
 
     return results
 
@@ -291,6 +296,7 @@ def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_l
         ACTIVE_PROCS.add(mpv_proc)
 
     result_action = "NEXT"
+    shown_title = title
     try:
         while mpv_proc.poll() is None and not STOP_EVENT.is_set():
             stdscr.erase()
@@ -299,13 +305,16 @@ def play_fast_ui(stdscr, playable_target, title, mode_label, queue_label, next_l
             paused = bool(get_mpv_prop("pause", False))
             pos = get_mpv_prop("time-pos", 0) or 0
             dur = get_mpv_prop("duration", 0) or 0
+            media_title = get_mpv_prop("media-title", None)
+            if isinstance(media_title, str) and media_title.strip():
+                shown_title = media_title.strip()
 
             stdscr.addstr(0, 1, f"[CYBER-FAST PLAYER] :: {mode_label}"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
             stdscr.addstr(1, 1, ("." * max(1, w - 2)), curses.color_pair(1))
             stdscr.addstr(3, 1, f"QUEUE   : {queue_label}"[:max(1, w - 2)], curses.color_pair(1))
             stdscr.addstr(4, 1, f"NEXT-UP : {next_label}"[:max(1, w - 2)], curses.color_pair(3))
             stdscr.addstr(6, 1, f"NOW PLAYING ({'PAUSED' if paused else 'ACTIVE'}):"[:max(1, w - 2)], curses.color_pair(1) | curses.A_BOLD)
-            stdscr.addstr(7, 1, f"> {title}"[:max(1, w - 2)], curses.color_pair(4) | curses.A_BOLD)
+            stdscr.addstr(7, 1, f"> {shown_title}"[:max(1, w - 2)], curses.color_pair(4) | curses.A_BOLD)
 
             bar_y = 9
             bar_w = max(8, w - 18)
